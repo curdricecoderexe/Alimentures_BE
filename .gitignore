@@ -1,0 +1,16 @@
+node_modules/
+
+# Env / secrets — NEVER commit
+.env
+.env.*
+!.env.example
+config/serviceAccountKey.json
+*.pem
+*-key.json
+
+# Logs
+*.log
+logs/
+
+.DS_Store
+coverage/
