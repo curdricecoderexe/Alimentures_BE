@@ -12,7 +12,10 @@
     "start": "node index.js",
     "start:dev": "nodemon index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:integration": "firebase emulators:exec --only firestore --project alimentures-test \"vitest run\"",
+    "sim:webhook": "node scripts/simulate-webhook.js",
+    "analytics:retention": "node scripts/analytics-retention.js"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
