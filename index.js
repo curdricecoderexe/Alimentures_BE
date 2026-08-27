@@ -43,8 +43,11 @@ if (missingEnvs.length > 0) {
   process.exit(1);
 }
 
-// Trust the single Render/Netlify proxy hop so req.ip and rate-limit keys are the real client IP.
-app.set('trust proxy', 1);
+// Number of proxy hops in front of the app, so req.ip / rate-limit keys resolve
+// to the real client IP. 1 = a single nginx (or Render). 2 = Cloudflare -> nginx.
+// Set TRUST_PROXY_HOPS to match your edge. Never leave this higher than reality:
+// an over-count lets a client spoof X-Forwarded-For and bypass rate limits.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
 
 // ─── 2. SECURITY HEADERS ──────────────────────────────────────────────────────
 app.use(helmet({
