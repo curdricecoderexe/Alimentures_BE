@@ -11,9 +11,6 @@
   "scripts": {
     "start": "node index.js",
     "start:dev": "nodemon index.js",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:integration": "firebase emulators:exec --only firestore --project alimentures-test \"vitest run\"",
     "sim:webhook": "node scripts/simulate-webhook.js",
     "analytics:retention": "node scripts/analytics-retention.js"
   },
@@ -27,15 +24,14 @@
     "helmet": "^8.3.0",
     "morgan": "^1.11.0",
     "nodemailer": "^9.0.6",
+    "pdfkit": "^0.20.1",
     "razorpay": "^2.9.6",
     "socket.io": "^4.8.3",
     "uuid": "^11.1.1"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^3.2.4",
     "axios": "^1.13.2",
-    "nodemon": "^3.0.1",
-    "supertest": "^7.1.4",
-    "vitest": "^3.2.4"
+    "country-state-city": "^3.2.1",
+    "nodemon": "^3.0.1"
   }
 }

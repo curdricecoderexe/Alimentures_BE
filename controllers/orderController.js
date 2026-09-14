@@ -1,6 +1,10 @@
 const admin = require("firebase-admin");
 const db = require("../config/firebase");
 const { sendMail } = require('../utils/mailer');
+const { buildOrderEmail } = require('../utils/emailTemplates');
+const { buildInvoicePdf } = require('../utils/invoicePdf');
+const { computeDeliveryFee, isValidPincode, DeliveryError } = require('../services/deliveryService');
+const { DELIVERY_METHODS } = require('../config/deliveryConstants');
 const { createNotification } = require('./notificationController');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -8,17 +12,51 @@ const { incrementSalesAnalytics, decrementSalesAnalytics } = require("../service
 const { createAuditLog } = require('../services/auditService');
 const {
   ORDER_TRANSITIONS,
-  DELIVERY_ALLOWED_TARGET_STATES,
-  CUSTOMER_CANCELLABLE_STATES,
-  ADMIN_CANCELLABLE_STATES,
   REFUNDABLE_STATES,
   LIMITS,
 } = require('../config/constants');
 const log = require('../lib/logger');
+const { runOrdered } = require('../lib/resilientQuery');
 
 const LIST_LIMIT_MAX = LIMITS.LIST_LIMIT_MAX;
 
 const couponRedemptionId = (couponId, uid) => `${couponId}_${uid}`;
+
+/**
+ * Send a branded transactional email for an order lifecycle event.
+ * Fire-and-forget — never throws, never blocks the response.
+ * `kind`: 'placed' | 'paid' | 'status' | 'cancelled' | 'refunded'.
+ * On delivery a modern PDF invoice is generated and attached.
+ */
+async function sendOrderEmail(orderId, kind, extra = {}) {
+  try {
+    const snap = await db.collection('orders').doc(orderId).get();
+    if (!snap.exists) return;
+    const order = snap.data();
+    const to = order.customerInfo && order.customerInfo.email;
+    if (!to) return;
+
+    const { subject, text, html, attachments } = buildOrderEmail({ order, orderId, kind, ...extra });
+    const atts = Array.isArray(attachments) ? [...attachments] : [];
+
+    if (kind === 'status' && extra.status === 'delivered') {
+      try {
+        const pdf = await buildInvoicePdf(order, orderId);
+        atts.push({
+          filename: `Alimenture-Invoice-${String(orderId).slice(-8).toUpperCase()}.pdf`,
+          content: pdf,
+          contentType: 'application/pdf',
+        });
+      } catch (err) {
+        log.warn('order.invoice_pdf_failed', { orderId, err });
+      }
+    }
+
+    await sendMail(to, subject, text, html, atts);
+  } catch (err) {
+    log.warn('order.email_failed', { orderId, kind, err });
+  }
+}
 
 function computeDiscount(coupon, subtotal) {
   if (coupon.discountType === 'percentage') {
@@ -165,7 +203,7 @@ function applyOrderReversal(t, oData, rev) {
   for (const [, u] of rev.productUpdates) {
     t.update(u.ref, {
       variants: u.variants,
-      totalStock: admin.firestore.FieldValue.increment(u.quantityChange),
+      stock: admin.firestore.FieldValue.increment(u.quantityChange),
     });
   }
   if (oData.reservationId) {
@@ -241,7 +279,7 @@ const releaseReservation = async (reservationId, status = 'RELEASED') => {
       for (const [, update] of productUpdates) {
         t.update(update.ref, {
           variants: update.variants,
-          totalStock: admin.firestore.FieldValue.increment(update.quantityChange)
+          stock: admin.firestore.FieldValue.increment(update.quantityChange)
         });
       }
       t.update(resRef, { status: status, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
@@ -294,36 +332,32 @@ exports.getOrders = async (req, res) => {
   try {
     const { lastId, status, paymentMethod, search } = req.query;
     const limit = Math.min(LIST_LIMIT_MAX, Math.max(1, Number(req.query.limit) || 50));
-    let query = db.collection("orders").orderBy("createdAt", "desc");
 
-    if (req.user && req.user.role === 'delivery') {
-      query = query.where("deliveryPerson.uid", "==", req.user.uid);
-    }
-    
+    let filtered = db.collection("orders");
     if (status) {
-       query = query.where("status", "==", status);
+       filtered = filtered.where("status", "==", status);
     }
-    
     if (paymentMethod) {
-       query = query.where("customerInfo.paymentMethod", "==", paymentMethod);
+       filtered = filtered.where("customerInfo.paymentMethod", "==", paymentMethod);
     }
-    
     // Firestore lacks native full-text search without Algolia/Elasticsearch.
     // For simple prefix matching on email:
     if (search) {
-       query = query.where("customerInfo.email", ">=", search)
-                    .where("customerInfo.email", "<=", search + '\uf8ff');
+       filtered = filtered.where("customerInfo.email", ">=", search)
+                          .where("customerInfo.email", "<=", search + '\uf8ff');
     }
 
-    query = query.limit(limit);
-
+    let ordered = filtered.orderBy("createdAt", "desc").limit(limit);
     if (lastId) {
       const lastDoc = await db.collection("orders").doc(lastId).get();
-      if (lastDoc.exists) query = query.startAfter(lastDoc);
+      if (lastDoc.exists) ordered = ordered.startAfter(lastDoc);
     }
 
-    const snapshot = await query.get();
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    // Fallback (composite index still building): unordered fetch + in-memory sort.
+    const docs = await runOrdered(ordered, filtered.limit(500), {
+      orderField: 'createdAt', dir: 'desc', limit, requestId: req.id,
+    });
+    const orders = docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
     return res.status(200).json({
       success: true,
@@ -340,16 +374,18 @@ exports.getOrders = async (req, res) => {
 
 async function ordersForEmail(email, req, res) {
   const limit = Math.min(LIST_LIMIT_MAX, Math.max(1, Number(req.query.limit) || 50));
-  let query = db.collection("orders")
-    .where("customerInfo.email", "==", email)
-    .orderBy("createdAt", "desc")
-    .limit(limit);
+  const filtered = db.collection("orders").where("customerInfo.email", "==", email);
+  let ordered = filtered.orderBy("createdAt", "desc").limit(limit);
   if (req.query.lastId) {
     const lastDoc = await db.collection("orders").doc(req.query.lastId).get();
-    if (lastDoc.exists) query = query.startAfter(lastDoc);
+    if (lastDoc.exists) ordered = ordered.startAfter(lastDoc);
   }
-  const snapshot = await query.get();
-  const orders = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  // Fallback path (composite index still building): fetch this user's orders
+  // unordered (auto single-field index only) and sort in memory. Capped for safety.
+  const docs = await runOrdered(ordered, filtered.limit(500), {
+    orderField: 'createdAt', dir: 'desc', limit, requestId: req.id,
+  });
+  const orders = docs.map((doc) => ({ id: doc.id, ...doc.data() }));
   return res.status(200).json({
     success: true,
     count: orders.length,
@@ -389,12 +425,10 @@ exports.getOrderById = async (req, res) => {
 
     // IDOR protection:
     //  - admin / staff: any order
-    //  - delivery: only an order assigned to them
     //  - customer: only their own order
     const role = req.user?.role?.toLowerCase();
     const isAuthorized =
       ['admin', 'staff'].includes(role) ||
-      (role === 'delivery' && orderData.deliveryPerson?.uid === req.user.uid) ||
       orderData.userId === req.user.uid;
 
     if (!isAuthorized) {
@@ -409,8 +443,6 @@ exports.getOrderById = async (req, res) => {
 };
 
 const RAZORPAY_RESERVATION_MINUTES = 10;
-const ALLOWED_PAYMENT_METHODS = ['razorpay', 'cod'];
-const MAX_OPEN_COD_ORDERS = 3;
 
 // Only these customerInfo sub-fields are accepted from the client; email is
 // always taken from the authenticated session.
@@ -427,8 +459,11 @@ function sanitizeCustomerInfo(ci = {}, sessionEmail) {
     address: s(ci.address, 300),
     city: s(ci.city, 120),
     state: s(ci.state, 120),
-    pincode: s(ci.pincode, 12),
-    paymentMethod: ALLOWED_PAYMENT_METHODS.includes(ci.paymentMethod) ? ci.paymentMethod : 'cod',
+    // Indian PIN: digits only, max 6. Kept lenient (not rejected here) so old
+    // free-text addresses don't break; delivery resolution validates strictly.
+    pincode: s(ci.pincode, 12).replace(/\D/g, '').slice(0, 6),
+    // Razorpay is the only supported payment method — never trust the client here.
+    paymentMethod: 'razorpay',
   };
   if (ci.coords && typeof ci.coords === 'object' && Number.isFinite(Number(ci.coords.lat)) && Number.isFinite(Number(ci.coords.lng))) {
     out.coords = { lat: Number(ci.coords.lat), lng: Number(ci.coords.lng) };
@@ -450,27 +485,6 @@ exports.createOrder = async (req, res) => {
     }
 
     const idempotencyKey = req.headers['idempotency-key'] || null;
-    const isRazorpay = customerInfo.paymentMethod === 'razorpay';
-
-    // COD abuse control: cap concurrent unfulfilled Cash-on-Delivery orders per user.
-    if (!isRazorpay) {
-      const openStates = ['pending', 'processing', 'packed', 'shipped', 'out_for_delivery'];
-      const recent = await db.collection('orders')
-        .where('userId', '==', uid)
-        .orderBy('createdAt', 'desc')
-        .limit(25)
-        .get();
-      const openCod = recent.docs.filter((d) => {
-        const o = d.data();
-        return o.customerInfo?.paymentMethod === 'cod' && openStates.includes(o.status);
-      }).length;
-      if (openCod >= MAX_OPEN_COD_ORDERS) {
-        return res.status(429).json({
-          success: false,
-          error: "You have too many open Cash-on-Delivery orders. Please receive or cancel one before placing another.",
-        });
-      }
-    }
 
     // ── 1. Authoritative subtotal + server-built item list (pre-txn) ──
     // Every stored item field comes from the product doc, never the client, so a
@@ -516,7 +530,27 @@ exports.createOrder = async (req, res) => {
       });
     }
 
-    const shipping = calculatedSubtotal > 500 || calculatedSubtotal === 0 ? 0 : 50;
+    // ── 1b. Authoritative delivery fee (server-side; the client fee is never trusted) ──
+    // deliveryMethod comes from the client's choice; the FEE is resolved here from
+    // the `deliveryPincodes` / `deliverySettings` config. A missing or malformed
+    // PIN falls back to the global default (backward-compatible with old clients);
+    // an explicitly unavailable PIN is rejected.
+    const deliveryMethod = DELIVERY_METHODS.includes(req.body.deliveryMethod) ? req.body.deliveryMethod : 'standard';
+    const resolvePincode = isValidPincode(customerInfo.pincode) ? customerInfo.pincode : '';
+    let delivery;
+    try {
+      delivery = await computeDeliveryFee({
+        pincode: resolvePincode,
+        method: deliveryMethod,
+        subtotal: calculatedSubtotal,
+      });
+    } catch (delErr) {
+      if (delErr instanceof DeliveryError) {
+        return res.status(400).json({ success: false, error: delErr.publicMessage, code: delErr.code });
+      }
+      throw delErr;
+    }
+    const shipping = delivery.fee;
 
     // ── 2. Resolve the coupon by code (existence/active/expiry/min gate here;
     //       the authoritative consume + per-user + usage-limit check is in the txn) ──
@@ -561,15 +595,15 @@ exports.createOrder = async (req, res) => {
         });
       }
 
-      // Consume the coupon inside the transaction for BOTH payment methods so
-      // concurrent checkouts can't over-redeem. Razorpay redemptions are marked
-      // `pending` and released if the payment never completes.
+      // Consume the coupon inside the transaction so concurrent checkouts can't
+      // over-redeem. The redemption is marked `pending` and released if the
+      // payment never completes.
       let discountAmount = 0;
       let couponId = null;
       let couponCode2 = null;
       if (couponRef) {
         const consumed = await consumeCouponInTxn(t, {
-          couponRef, uid, subtotal: calculatedSubtotal, pending: isRazorpay,
+          couponRef, uid, subtotal: calculatedSubtotal, pending: true,
         });
         discountAmount = consumed.discountAmount;
         couponId = consumed.couponId;
@@ -582,14 +616,18 @@ exports.createOrder = async (req, res) => {
       for (const [, u] of productUpdates) {
         t.update(u.ref, {
           variants: u.variants,
-          totalStock: admin.firestore.FieldValue.increment(-u.quantityChange),
+          stock: admin.firestore.FieldValue.increment(-u.quantityChange),
         });
       }
 
       const baseOrder = {
         items: sanitizedItems,
         subtotal: calculatedSubtotal,
-        shipping,
+        shipping, // === deliveryFee — kept for backward compatibility
+        deliveryFee: delivery.fee,
+        deliveryMethod: delivery.method,
+        deliveryPincode: resolvePincode || customerInfo.pincode || null,
+        deliveryEstimate: delivery.eta || null,
         totalAmount,
         discountAmount,
         couponId,
@@ -610,86 +648,61 @@ exports.createOrder = async (req, res) => {
         });
       }
 
-      if (isRazorpay) {
-        const reservationRef = db.collection("stockReservations").doc();
-        t.set(reservationRef, {
-          items: sanitizedItems,
-          status: "ACTIVE",
-          userId: uid,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          expiresAt: new Date(Date.now() + RAZORPAY_RESERVATION_MINUTES * 60000),
-        });
-        return { isRazorpay: true, reservationId: reservationRef.id, baseOrder, totalAmount, discountAmount, couponId, couponCode: couponCode2, idempRef };
-      }
-
-      const newOrderRef = db.collection("orders").doc();
-      const orderData = { ...baseOrder, status: "pending" };
-      t.set(newOrderRef, orderData);
-      incrementSalesAnalytics(t, orderData, 'cod');
-      if (idempRef) {
-        t.update(idempRef, { status: 'COMPLETE', orderId: newOrderRef.id });
-      }
-      return { isRazorpay: false, orderId: newOrderRef.id, customerInfo };
+      const reservationRef = db.collection("stockReservations").doc();
+      t.set(reservationRef, {
+        items: sanitizedItems,
+        status: "ACTIVE",
+        userId: uid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        expiresAt: new Date(Date.now() + RAZORPAY_RESERVATION_MINUTES * 60000),
+      });
+      return { reservationId: reservationRef.id, baseOrder, totalAmount, discountAmount, couponId, couponCode: couponCode2, idempRef };
     });
 
-    // ── 4. Razorpay: create gateway order + persist ──
-    if (txResult.isRazorpay) {
-      const { reservationId, totalAmount } = txResult;
-      try {
-        const rzpOrder = await razorpay.orders.create({
-          amount: Math.round(totalAmount * 100),
-          currency: "INR",
-          receipt: `rcpt_${Date.now()}`,
-        });
+    // ── 4. Create the Razorpay gateway order + persist ──
+    const { reservationId, totalAmount } = txResult;
+    try {
+      const rzpOrder = await razorpay.orders.create({
+        amount: Math.round(totalAmount * 100),
+        currency: "INR",
+        receipt: `rcpt_${Date.now()}`,
+      });
 
-        const orderData = {
-          ...txResult.baseOrder,
-          status: "payment_pending",
-          razorpayOrderId: rzpOrder.id,
+      const orderData = {
+        ...txResult.baseOrder,
+        status: "payment_pending",
+        razorpayOrderId: rzpOrder.id,
+        reservationId,
+      };
+      const newOrderRef = await db.collection("orders").add(orderData);
+      await db.collection("stockReservations").doc(reservationId).update({
+        orderId: newOrderRef.id,
+        razorpayOrderId: rzpOrder.id,
+      });
+      if (txResult.idempRef) {
+        await txResult.idempRef.set({
+          orderId: newOrderRef.id,
           reservationId,
-        };
-        const newOrderRef = await db.collection("orders").add(orderData);
-        await db.collection("stockReservations").doc(reservationId).update({
-          orderId: newOrderRef.id,
           razorpayOrderId: rzpOrder.id,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         });
-        if (txResult.idempRef) {
-          await txResult.idempRef.set({
-            orderId: newOrderRef.id,
-            reservationId,
-            razorpayOrderId: rzpOrder.id,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-          });
-        }
-
-        return res.status(201).json({
-          success: true,
-          isRazorpay: true,
-          razorpayOrderId: rzpOrder.id,
-          amount: rzpOrder.amount,
-          key_id: process.env.RAZORPAY_KEY_ID,
-          orderId: newOrderRef.id,
-        });
-      } catch (rzpErr) {
-        await releaseReservation(reservationId, 'RELEASED');
-        await releaseCoupon(txResult.couponId, uid); // free the provisional redemption
-        log.error('order.razorpay_init_failed', { requestId: req.id, err: rzpErr });
-        return res.status(502).json({ success: false, error: "Failed to initialize payment gateway" });
       }
-    }
 
-    // ── 5. COD: notify ──
-    const orderId = txResult.orderId;
-    if (customerInfo.email) {
-      sendMail(customerInfo.email, "Order Placed Successfully", `Your order #${orderId.slice(-6).toUpperCase()} has been placed successfully.`);
+      return res.status(201).json({
+        success: true,
+        isRazorpay: true,
+        razorpayOrderId: rzpOrder.id,
+        amount: rzpOrder.amount,
+        key_id: process.env.RAZORPAY_KEY_ID,
+        orderId: newOrderRef.id,
+      });
+    } catch (rzpErr) {
+      await releaseReservation(reservationId, 'RELEASED');
+      await releaseCoupon(txResult.couponId, uid); // free the provisional redemption
+      log.error('order.razorpay_init_failed', { requestId: req.id, err: rzpErr });
+      return res.status(502).json({ success: false, error: "Failed to initialize payment gateway" });
     }
-    ['admin', 'staff'].forEach(target => {
-      createNotification(target, 'New Order Received', `Order #${orderId.slice(-6).toUpperCase()} placed by ${customerInfo.firstName}`);
-    });
-    createNotification(uid, 'Order Placed Successfully', `Your order #${orderId.slice(-6).toUpperCase()} has been placed.`);
-
-    return res.status(201).json({ success: true, id: orderId });
   } catch (err) {
     const map = {
       DUPLICATE_CHECKOUT: [409, "Duplicate checkout request detected"],
@@ -754,6 +767,27 @@ exports.verifyRazorpay = async (req, res) => {
 };
 
 /**
+ * Condense a Razorpay payment entity into a small, display-friendly summary
+ * ({ method: 'upi' | 'card' | ..., detail: 'HDFC ••4242' }) stored on the order
+ * so admin/customer screens can show "UPI", "Card", etc. instead of just
+ * "Online".
+ */
+function summarizePayment(p) {
+  if (!p || !p.method) return null;
+  const out = { method: p.method };
+  if (p.method === 'card' && p.card) {
+    out.detail = [p.card.network || 'Card', p.card.last4 ? `••${p.card.last4}` : ''].join(' ').trim();
+  } else if (p.method === 'upi') {
+    out.detail = p.vpa || p.upi?.vpa || 'UPI';
+  } else if (p.method === 'netbanking') {
+    out.detail = p.bank || 'Netbanking';
+  } else if (p.method === 'wallet') {
+    out.detail = p.wallet || 'Wallet';
+  }
+  return out;
+}
+
+/**
  * Shared, idempotent confirmation of a paid Razorpay order. Runs in a
  * transaction guarded by status === 'payment_pending', so the verify call and
  * the webhook race safely — only one wins.
@@ -761,6 +795,14 @@ exports.verifyRazorpay = async (req, res) => {
 async function confirmRazorpayPayment(orderId, paymentId, source) {
   const orderRef = db.collection("orders").doc(orderId);
   let confirmedData = null;
+
+  // Fetch the instrument used (UPI / card / netbanking / wallet) for display.
+  let paymentDetails = null;
+  try {
+    paymentDetails = summarizePayment(await razorpay.payments.fetch(paymentId));
+  } catch (e) {
+    log.warn('order.payment_fetch_failed', { orderId, err: e });
+  }
 
   await db.runTransaction(async (t) => {
     const oDoc = await t.get(orderRef);
@@ -787,6 +829,7 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
     t.update(orderRef, {
       status: newOrderStatus,
       razorpayPaymentId: paymentId,
+      ...(paymentDetails ? { paymentDetails } : {}),
       paidAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -797,9 +840,7 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
   if (!confirmedData) return; // someone else already confirmed
 
   const short = `#${orderId.slice(-6).toUpperCase()}`;
-  if (confirmedData.customerInfo?.email) {
-    sendMail(confirmedData.customerInfo.email, "Payment Successful - Order Confirmed", `Your payment for order ${short} was successful.`);
-  }
+  sendOrderEmail(orderId, 'paid');
   ['admin', 'staff'].forEach((target) => {
     createNotification(target, 'New Paid Order', `Paid order ${short} received via Razorpay${source === 'webhook' ? ' (webhook)' : ''}`);
   });
@@ -854,9 +895,7 @@ async function reconcileDashboardRefund(entity) {
   log.info('webhook.refund_reconciled', { orderId: orderRef.id, refundId });
   const short = `#${orderRef.id.slice(-6).toUpperCase()}`;
   const fresh = (await orderRef.get()).data();
-  if (fresh?.customerInfo?.email) {
-    sendMail(fresh.customerInfo.email, 'Refund Processed', `A refund for order ${short} has been processed to your original payment method.`);
-  }
+  sendOrderEmail(orderRef.id, 'refunded', { refundAmount: amountRupees || Number(fresh?.totalAmount) || 0 });
   if (fresh?.userId) createNotification(fresh.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
 }
 
@@ -920,7 +959,7 @@ exports.razorpayWebhook = async (req, res) => {
 };
 
 /**
- * PUT /orders/:id/status  (staff / delivery) — FULFILMENT transitions only.
+ * PUT /orders/:id/status  (staff) — FULFILMENT transitions only.
  * Cancellation and refunds are handled by dedicated routes.
  */
 exports.updateOrderStatus = async (req, res) => {
@@ -947,16 +986,6 @@ exports.updateOrderStatus = async (req, res) => {
       existingData = oData;
       const currentStatus = oData.status;
 
-      // Delivery personnel: must be assigned, and may only advance to a delivery state
-      if (role === 'delivery') {
-        if (!oData.deliveryPerson || oData.deliveryPerson.uid !== req.user.uid) {
-          throw new Error("FORBIDDEN: You are not assigned to this order");
-        }
-        if (!DELIVERY_ALLOWED_TARGET_STATES.includes(status)) {
-          throw new Error("FORBIDDEN: Delivery personnel can only set 'out_for_delivery' or 'delivered'");
-        }
-      }
-
       // Idempotent no-op
       if (currentStatus === status) {
         t.update(docRef, { updatedAt: admin.firestore.FieldValue.serverTimestamp() });
@@ -975,7 +1004,7 @@ exports.updateOrderStatus = async (req, res) => {
       t.update(docRef, updateData);
     });
 
-    if (req.user && ['admin', 'staff', 'delivery'].includes(role)) {
+    if (req.user && ['admin', 'staff'].includes(role)) {
       createAuditLog({
         adminId: req.user.uid,
         adminEmail: req.user.email || 'unknown',
@@ -987,9 +1016,7 @@ exports.updateOrderStatus = async (req, res) => {
       });
     }
 
-    if (existingData.customerInfo?.email) {
-      sendMail(existingData.customerInfo.email, `Order Status Update: ${status.toUpperCase()}`, `Your order #${id.slice(-6).toUpperCase()} is now ${status.replace(/_/g, ' ')}.`);
-    }
+    sendOrderEmail(id, 'status', { status });
     ['admin', 'staff'].forEach((target) => {
       createNotification(target, 'Order Status Updated', `Order #${id.slice(-6).toUpperCase()} is now ${status.replace(/_/g, ' ')}`);
     });
@@ -1007,86 +1034,29 @@ exports.updateOrderStatus = async (req, res) => {
   }
 };
 
-/**
- * Shared cancel logic. `actor` is 'customer' or 'admin'.
- */
-async function performCancel({ id, actor, uid }) {
-  const docRef = db.collection("orders").doc(id);
-  let existingData;
-
-  await db.runTransaction(async (t) => {
-    // ── reads ──
-    const oDoc = await t.get(docRef);
-    if (!oDoc.exists) throw new Error("NOT_FOUND");
-    const oData = oDoc.data();
-    existingData = oData;
-
-    if (actor === 'customer' && oData.userId !== uid) throw new Error("FORBIDDEN");
-
-    const cancellable = actor === 'admin' ? ADMIN_CANCELLABLE_STATES : CUSTOMER_CANCELLABLE_STATES;
-    if (!cancellable.includes(oData.status)) throw new Error("INVALID_STATE");
-
-    const rev = await readOrderReversal(t, oData);
-
-    // ── writes ──
-    t.update(docRef, { status: 'cancelled', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-    applyOrderReversal(t, oData, rev);
-
-    const paymentMethod = oData.customerInfo?.paymentMethod === 'razorpay' ? 'razorpay' : 'cod';
-    if (oData.status !== 'payment_pending') {
-      decrementSalesAnalytics(t, oData, paymentMethod);
-    }
-  });
-
-  return existingData;
-}
-
-exports.cancelOrder = async (req, res) => {
+// PUT /orders/:id/abandon-payment  (customer, own order) — NOT an order-cancellation
+// feature: this only ever touches an order that never got paid (still
+// `payment_pending`), releasing the stock reservation immediately instead of
+// leaving it locked until the reservation's own expiry + cleanup cron catch up.
+// A confirmed/placed order cannot be reached through this path.
+exports.abandonPayment = async (req, res) => {
   try {
     const { id } = req.params;
-    const existingData = await performCancel({ id, actor: 'customer', uid: req.user.uid });
-
-    if (existingData.customerInfo?.email) {
-      sendMail(existingData.customerInfo.email, `Order Cancelled`, `Your order #${id.slice(-6).toUpperCase()} has been successfully cancelled.`);
+    const docRef = db.collection("orders").doc(id);
+    const snap = await docRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: "Order not found" });
+    const order = snap.data();
+    if (order.userId !== req.user.uid) return res.status(403).json({ success: false, error: "Access denied" });
+    if (order.status !== 'payment_pending') {
+      return res.status(400).json({ success: false, error: "Order is not an unpaid pending payment" });
     }
-    ['admin', 'staff'].forEach((target) => {
-      createNotification(target, 'Order Cancelled', `Order #${id.slice(-6).toUpperCase()} was cancelled by the customer`);
-    });
-    return res.status(200).json({ success: true, message: "Order cancelled successfully" });
-  } catch (err) {
-    if (err.message === "FORBIDDEN") return res.status(403).json({ success: false, error: "Access denied" });
-    if (err.message === "NOT_FOUND") return res.status(404).json({ success: false, error: "Order not found" });
-    if (err.message === "INVALID_STATE") return res.status(400).json({ success: false, error: "Order cannot be cancelled at this stage" });
-    log.error('order.cancel_failed', { requestId: req.id, orderId: req.params.id, err });
-    return res.status(500).json({ success: false, error: "Failed to cancel order" });
-  }
-};
-
-// POST /orders/:id/cancel-admin  (admin) — cancel any order from a broader set of states.
-exports.cancelOrderAdmin = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const existingData = await performCancel({ id, actor: 'admin' });
-
-    createAuditLog({
-      adminId: req.user.uid,
-      adminEmail: req.user.email || 'unknown',
-      action: 'CANCEL_ORDER',
-      resourceId: id,
-      previousState: { status: existingData.status },
-      newState: { status: 'cancelled' },
-      ipAddress: req.ip,
-    });
-
-    if (existingData.customerInfo?.email) {
-      sendMail(existingData.customerInfo.email, `Order Cancelled`, `Your order #${id.slice(-6).toUpperCase()} has been cancelled by our team.`);
+    if (order.reservationId) {
+      await releaseReservation(order.reservationId, 'RELEASED');
     }
-    return res.status(200).json({ success: true, message: "Order cancelled" });
+    return res.status(200).json({ success: true, message: "Payment attempt released" });
   } catch (err) {
-    if (err.message === "NOT_FOUND") return res.status(404).json({ success: false, error: "Order not found" });
-    if (err.message === "INVALID_STATE") return res.status(400).json({ success: false, error: "Order cannot be cancelled at this stage" });
-    log.error('order.admin_cancel_failed', { requestId: req.id, orderId: req.params.id, err });
-    return res.status(500).json({ success: false, error: "Failed to cancel order" });
+    log.error('order.abandon_payment_failed', { requestId: req.id, orderId: req.params.id, err });
+    return res.status(500).json({ success: false, error: "Failed to release payment attempt" });
   }
 };
 
@@ -1171,9 +1141,7 @@ exports.refundOrder = async (req, res) => {
     });
 
     const short = `#${id.slice(-6).toUpperCase()}`;
-    if (existingData.customerInfo?.email) {
-      sendMail(existingData.customerInfo.email, `Refund Processed`, `A refund of ₹${requested} for order ${short} has been processed${isRazorpay ? ' to your original payment method' : ''}.`);
-    }
+    sendOrderEmail(id, 'refunded', { refundAmount: requested });
     if (existingData.userId) {
       createNotification(existingData.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
     }
@@ -1189,166 +1157,3 @@ exports.refundOrder = async (req, res) => {
 // NOTE: hard-deleting orders is intentionally NOT exposed — orders are financial
 // records. Use cancel / refund instead.
 
-exports.assignDeliveryPerson = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { deliveryUid, deliveryName } = req.body;
-
-    if (!deliveryUid || !deliveryName) {
-      return res.status(400).json({ success: false, error: "Delivery personnel details are required" });
-    }
-
-    const docRef = db.collection("orders").doc(id);
-    const existing = await docRef.get();
-
-    if (!existing.exists) {
-      return res.status(404).json({ success: false, error: "Order not found" });
-    }
-    
-    if (existing.data().deliveryPerson?.uid === deliveryUid) {
-      return res.status(200).json({ success: true, message: "Already assigned to this delivery person" });
-    }
-
-    const deliveryUserRef = db.collection("users").doc(deliveryUid);
-    const deliveryUser = await deliveryUserRef.get();
-    
-    if (!deliveryUser.exists || deliveryUser.data().role !== 'delivery') {
-      return res.status(400).json({ success: false, error: "Invalid delivery personnel. User does not exist or does not have 'delivery' role." });
-    }
-
-    await docRef.update({
-      deliveryPerson: {
-        uid: deliveryUid,
-        name: deliveryName,
-        assignedAt: admin.firestore.FieldValue.serverTimestamp(),
-        status: 'pending' // new status for delivery person acceptance
-      },
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    createNotification(deliveryUid, 'New Delivery Assigned', `You have been assigned order #${id.slice(-6).toUpperCase()}`);
-    ['admin', 'staff'].forEach(target => {
-      createNotification(target, 'Delivery Assigned', `Order #${id.slice(-6).toUpperCase()} assigned to ${deliveryName}`);
-    });
-    
-    const existingData = existing.data();
-    if (existingData.userId) {
-      createNotification(existingData.userId, 'Driver Assigned', `A delivery person has been assigned to your order #${id.slice(-6).toUpperCase()}`);
-    }
-    
-    return res.status(200).json({ success: true, message: "Delivery person assigned successfully" });
-  } catch (err) {
-    console.error("ASSIGN DELIVERY ERROR:", err);
-    return res.status(500).json({ success: false, error: "Assignment failed" });
-  }
-};
-exports.acceptRejectDelivery = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { action } = req.body; // 'accept' or 'reject'
-    
-    if (action !== 'accept' && action !== 'reject') {
-      return res.status(400).json({ success: false, error: "Invalid action" });
-    }
-
-    const docRef = db.collection("orders").doc(id);
-    const existing = await docRef.get();
-
-    if (!existing.exists) return res.status(404).json({ success: false, error: "Order not found" });
-
-    const orderData = existing.data();
-    if (!orderData.deliveryPerson || orderData.deliveryPerson.uid !== req.user.uid) {
-      return res.status(403).json({ success: false, error: "Not assigned to you" });
-    }
-
-    if (action === 'accept') {
-      await docRef.update({
-        'deliveryPerson.status': 'accepted',
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      ['admin', 'staff'].forEach(target => {
-        createNotification(target, 'Delivery Accepted', `Driver accepted order #${id.slice(-6).toUpperCase()}`);
-      });
-      
-      const existingData = existing.data();
-      if (existingData.userId) {
-        createNotification(existingData.userId, 'Driver en-route', `Our delivery partner has accepted your order #${id.slice(-6).toUpperCase()} and is preparing for delivery.`);
-      }
-      return res.status(200).json({ success: true, message: "Order accepted" });
-    } else {
-      // Rejecting order unassigns the delivery person
-      await docRef.update({
-        deliveryPerson: admin.firestore.FieldValue.delete(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      ['admin', 'staff'].forEach(target => {
-        createNotification(target, 'Delivery Rejected', `Driver rejected order #${id.slice(-6).toUpperCase()}! Needs reassignment.`);
-      });
-      return res.status(200).json({ success: true, message: "Order rejected" });
-    }
-  } catch (err) {
-    console.error("ACCEPT/REJECT DELIVERY ERROR:", err);
-    return res.status(500).json({ success: false, error: "Failed to process response" });
-  }
-};
-
-exports.addOrderFeedback = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const rating = Number(req.body.rating);
-    const comment = typeof req.body.comment === 'string' ? req.body.comment.trim().slice(0, 1000) : '';
-
-    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
-      return res.status(400).json({ success: false, error: "Rating must be an integer between 1 and 5" });
-    }
-
-    const ref = db.collection("orders").doc(id);
-    const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ success: false, error: "Order not found" });
-
-    const order = doc.data();
-    if (order.userId !== req.user.uid) {
-      return res.status(403).json({ success: false, error: "This is not your order" });
-    }
-    if ((order.status || '').toLowerCase() !== 'delivered') {
-      return res.status(400).json({ success: false, error: "You can only rate a delivered order" });
-    }
-    if (order.feedback) {
-      return res.status(409).json({ success: false, error: "Feedback already submitted for this order" });
-    }
-
-    await ref.update({
-      feedback: { rating, comment, submittedAt: admin.firestore.FieldValue.serverTimestamp() },
-    });
-
-    ['admin', 'staff'].forEach((target) =>
-      createNotification(target, 'New Order Feedback', `Order #${id.slice(-6).toUpperCase()} received a ${rating}-star rating`));
-
-    return res.status(200).json({ success: true, message: "Feedback submitted" });
-  } catch (err) {
-    log.error("order.feedback_failed", { requestId: req.id, orderId: req.params.id, err });
-    return res.status(500).json({ success: false, error: "Failed to save feedback" });
-  }
-};
-
-exports.getAllFeedbacks = async (req, res) => {
-  try {
-    const limit = Math.min(LIST_LIMIT_MAX, Math.max(1, Number(req.query.limit) || 100));
-    const snapshot = await db.collection("orders")
-      .where("feedback", "!=", null)
-      .orderBy("feedback")
-      .limit(limit)
-      .get();
-
-    const feedbacks = snapshot.docs.map(doc => ({
-      orderId: doc.id,
-      customerName: doc.data().customerInfo?.name,
-      ...doc.data().feedback
-    }));
-
-    return res.status(200).json({ success: true, data: feedbacks });
-  } catch (err) {
-    log.error("order.feedbacks_failed", { requestId: req.id, err });
-    return res.status(500).json({ success: false, error: "Failed to fetch feedbacks" });
-  }
-};

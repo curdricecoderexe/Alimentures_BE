@@ -11,11 +11,10 @@
 const ROLES = Object.freeze({
   ADMIN: 'admin',
   STAFF: 'staff',
-  DELIVERY: 'delivery',
   CUSTOMER: 'customer',
 });
 
-const PRIVILEGED_ROLES = Object.freeze(['admin', 'staff', 'delivery']);
+const PRIVILEGED_ROLES = Object.freeze(['admin', 'staff']);
 
 const ORDER_STATES = Object.freeze({
   PAYMENT_PENDING: 'payment_pending',
@@ -32,11 +31,11 @@ const ORDER_STATES = Object.freeze({
 
 /**
  * Fulfilment-only transitions for `PUT /orders/:id/status` (staff/delivery).
- * `cancelled` and `refunded` are NOT reachable here — they go through the
- * dedicated routes:
- *   - customer self-cancel:  PUT  /orders/:id/cancel
- *   - admin cancel:          POST /orders/:id/cancel-admin
- *   - admin refund:          POST /orders/:id/refund
+ * `refunded` is NOT reachable here — it goes through the dedicated admin
+ * refund route: POST /orders/:id/refund. There is no order-cancellation
+ * route; `cancelled` is only ever set by the reservation-release path for an
+ * order that never got past payment (see releaseReservation / abandonPayment
+ * in orderController.js).
  */
 const ORDER_TRANSITIONS = Object.freeze({
   payment_successful_no_stock: ['pending', 'processing'],
@@ -51,22 +50,8 @@ const ORDER_TRANSITIONS = Object.freeze({
   refunded: [],
 });
 
-/** States an order can be cancelled from by an admin (broader than customer). */
-const ADMIN_CANCELLABLE_STATES = Object.freeze([
-  'payment_pending', 'payment_successful_no_stock', 'pending',
-  'processing', 'packed', 'shipped', 'out_for_delivery',
-]);
-
 /** States an order can be refunded from. */
 const REFUNDABLE_STATES = Object.freeze(['delivered', 'out_for_delivery', 'shipped']);
-
-/** States a delivery person may set on an order assigned to them. */
-const DELIVERY_ALLOWED_TARGET_STATES = Object.freeze(['out_for_delivery', 'delivered']);
-
-/** States from which a customer may self-cancel their own order. */
-const CUSTOMER_CANCELLABLE_STATES = Object.freeze([
-  'payment_pending', 'pending', 'processing', 'packed',
-]);
 
 const LIMITS = Object.freeze({
   // Body parsing
@@ -104,9 +89,6 @@ module.exports = {
   PRIVILEGED_ROLES,
   ORDER_STATES,
   ORDER_TRANSITIONS,
-  DELIVERY_ALLOWED_TARGET_STATES,
-  CUSTOMER_CANCELLABLE_STATES,
-  ADMIN_CANCELLABLE_STATES,
   REFUNDABLE_STATES,
   LIMITS,
 };

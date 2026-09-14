@@ -20,6 +20,7 @@ const WRITABLE_FIELDS = [
   'price', 'stock', 'variants', 'image', 'secondaryImage', 'images',
   'isFeatured', 'isDraft', 'isPrivate', 'tags', 'nutrition', 'ingredients', 'weight',
   'discountPercent', 'badges', 'origin', 'shelfLife',
+  'tertiaryImage', 'cleanPromises', 'cleanBadges', 'nutritionFacts',
 ];
 
 // Fields never exposed on a public (non-staff) product read.
@@ -414,9 +415,10 @@ exports.deleteProduct = async (req, res) => {
 
 /**
  * PATCH /products/:id/stock  (staff) — Body: { adjustment, weight? }
- * Transactional. If `weight` is given (or the product has variants) the
- * adjustment applies to that variant and totalStock is kept in sync; otherwise
- * it adjusts the base `stock` field.
+ * Transactional. A product with more than one variant REQUIRES `weight` to
+ * say which pack size is being adjusted — silently guessing one would corrupt
+ * the others. `stock` (the aggregate total every list/dashboard reads) is
+ * always kept in sync with the variants array.
  */
 exports.updateProductStock = async (req, res) => {
   try {
@@ -437,14 +439,15 @@ exports.updateProductStock = async (req, res) => {
       const variants = Array.isArray(data.variants) ? data.variants.map((v) => ({ ...v })) : [];
 
       if (variants.length > 0) {
-        let idx = weight ? variants.findIndex((v) => v.weight === weight) : 0;
+        if (!weight && variants.length > 1) throw new Error("WEIGHT_REQUIRED");
+        const idx = weight ? variants.findIndex((v) => v.weight === weight) : 0;
         if (idx === -1) throw new Error("VARIANT_NOT_FOUND");
         const next = Number(variants[idx].stock || 0) + adjustment;
         if (next < 0) throw new Error("NEGATIVE");
         variants[idx].stock = next;
         t.update(docRef, {
           variants,
-          totalStock: admin.firestore.FieldValue.increment(adjustment),
+          stock: admin.firestore.FieldValue.increment(adjustment),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
         return { newStock: next, variant: variants[idx].weight };
@@ -462,6 +465,7 @@ exports.updateProductStock = async (req, res) => {
   } catch (err) {
     if (err.message === "NOT_FOUND") return res.status(404).json({ success: false, error: "Product not found" });
     if (err.message === "VARIANT_NOT_FOUND") return res.status(400).json({ success: false, error: "Variant not found" });
+    if (err.message === "WEIGHT_REQUIRED") return res.status(400).json({ success: false, error: "This product has multiple pack sizes — choose one to adjust" });
     if (err.message === "NEGATIVE") return res.status(400).json({ success: false, error: "Stock cannot go negative" });
     log.error("product.stock_update_failed", { requestId: req.id, err });
     return res.status(500).json({ success: false, error: "Failed to update stock" });

@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   createUser,
   loginUser,
+  verifyLoginOtp,
   getUsers,
   getUser,
   updateUser,
@@ -12,27 +13,25 @@ const {
   resetPasswordWithOtp,
   sendRegisterOtp,
   toggleUserStatus,
-  getDeliveryPersons,
   setUserRole,
   logoutUser
 } = require("../controllers/userController");
 
 const verifyToken = require("../middlewares/verifyToken");
 const isAdmin = require("../middlewares/isAdmin");
-const isStaff = require("../middlewares/isStaff");
 const { authLimiter, otpLimiter } = require("../middlewares/rateLimiters");
 
 // PUBLIC
 router.post("/send-otp", otpLimiter, sendRegisterOtp);
 router.post("/register", otpLimiter, createUser);
 router.post("/login", authLimiter, loginUser);
+router.post("/login/verify-otp", otpLimiter, verifyLoginOtp);
 router.post("/request-reset", otpLimiter, requestPasswordResetOtp);
 router.post("/reset-password", otpLimiter, resetPasswordWithOtp);
 
 // PROTECTED
 router.post("/logout", verifyToken, logoutUser);
 router.get("/", verifyToken, isAdmin, getUsers);
-router.get("/delivery", verifyToken, isStaff, getDeliveryPersons);
 router.get("/:uid", verifyToken, getUser);
 router.put("/:uid", verifyToken, updateUser);
 

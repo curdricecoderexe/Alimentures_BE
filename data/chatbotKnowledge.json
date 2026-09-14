@@ -1,0 +1,432 @@
+{
+  "meta": {
+    "knowledge_base_version": "2.0",
+    "last_updated": "2026-08-30",
+    "language_default": "en-IN",
+    "languages_supported": ["en", "ta", "hi"],
+    "currency": "INR",
+    "currency_symbol": "₹",
+    "timezone": "Asia/Kolkata",
+    "source_of_truth_note": "Prices, pack sizes, stock and delivery fees below are indicative. For a live order the bot MUST use the website / storefront API values, not these numbers. Policy text here mirrors the published policy pages on the website.",
+    "channels": ["website_chat_widget", "whatsapp", "instagram_dm"]
+  },
+
+  "business": {
+    "legal_name": "Alimenture Industries Private Limited",
+    "brand_name": "Alimenture",
+    "short_pitch": "Premium toxin-free nourishment made from ancient grains — clean-label cookies and biscuits, baked without maida, refined sugar, refined oil or preservatives.",
+    "founded": "December 2023",
+    "founders": ["Pavin Saminathan", "Magesh Mohan"],
+    "headquarters": "Chennai, Tamil Nadu, India",
+    "ships_to": "All serviceable PIN codes across India",
+    "philosophy": "Inspired by the green crusader Nammalvar — food should nourish people without adding preservatives.",
+    "tagline": "Healthy Food. Healthy Farmers. Healthy Planet.",
+    "website": "https://alimenture.com",
+    "working_hours": {
+      "text": "Monday to Saturday, 9:30 AM – 7:00 PM IST",
+      "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+      "open": "09:30",
+      "close": "19:00",
+      "closed": ["Sunday", "national public holidays"],
+      "off_hours_reply": "Our support team is available Mon–Sat, 9:30 AM – 7:00 PM IST. Leave your question and order number here and we'll reply on the next working day."
+    },
+    "contact": {
+      "support_email": "alimentureindustries@gmail.com",
+      "support_phones": ["+91 98847 33453", "+91 73581 96132"],
+      "partnership_email": "alimentureindustries@gmail.com",
+      "partnership_subject_hint": "Partnership Inquiry"
+    },
+    "compliance": {
+      "fssai_registered": true,
+      "fssai_operator": "M/s. Alimenture Industries Private Limited",
+      "fssai_categories": ["Bakery Products", "Ready-to-Eat Savouries"],
+      "fssai_valid_until": "2029-03-31",
+      "fssai_disclaimer": "FSSAI registration is a compliance requirement, not an endorsement or quality certification of individual products.",
+      "food_law": "Registered Food Business Operator under the Food Safety and Standards Act, 2006",
+      "gst_invoice": "GST invoices are issued with every order and available on request."
+    }
+  },
+
+  "brand_features": {
+    "clean_label_promises": [
+      "No maida (refined wheat flour)",
+      "No refined / white sugar",
+      "No refined oil",
+      "No artificial preservatives",
+      "No synthetic additives, colours or flavours",
+      "No trans fats"
+    ],
+    "how_we_make_it": [
+      "Ancient grains and millets as the base (ragi, jowar, thinai, quinoa, oats, multi-millet blends)",
+      "Natural sweeteners only — palm jaggery, country sugar, raw honey",
+      "Country cow butter / cold-pressed fats instead of refined oil",
+      "Slow-baked in small batches in FSSAI-compliant facilities to protect whole-grain nutrition"
+    ],
+    "positioning": "Clean-label everyday snacking for health-conscious families, parents buying for children, diabetics and pre-diabetics seeking lower-GI options, and gifting.",
+    "what_we_are_not": "Not a medical or therapeutic product. The bot must not make disease-treatment, weight-loss or cure claims."
+  },
+
+  "product_catalog": {
+    "notes": "Bulk pricing is per-pack and applies to a single product line's quantity. Combine-across-products bulk pricing is a human-only negotiation.",
+    "categories": [
+      { "id": "millet", "label": "Millet & Grain Cookies", "keywords": ["millet", "grain", "ragi", "jowar", "thinai", "multigrain"], "product_ids": ["ragi-cookies", "jowar-biscuits", "multimillet-cookies"] },
+      { "id": "premium", "label": "Protein & Premium", "keywords": ["protein", "premium", "quinoa", "high protein"], "product_ids": ["quinoa-cookies"] },
+      { "id": "classic", "label": "Everyday Classics", "keywords": ["classic", "everyday", "oats", "regular", "plain"], "product_ids": ["oats-cookies"] },
+      { "id": "gifting", "label": "Gifting", "keywords": ["gift", "box", "combo", "assorted", "hamper", "festival"], "product_ids": ["gift-box"] }
+    ],
+    "products": [
+      {
+        "id": "ragi-cookies",
+        "name": "Ragi Ancient Grain Cookies",
+        "category_id": "millet",
+        "keywords": ["ragi", "finger millet", "kelvaragu"],
+        "pack_size": "200g",
+        "price": 180,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 4, "price": 180 },
+          { "min_qty": 5, "max_qty": 9, "price": 170 },
+          { "min_qty": 10, "max_qty": null, "price": 160 }
+        ],
+        "sweetener": "Palm jaggery",
+        "key_ingredients": ["ragi (finger millet) flour", "palm jaggery", "country cow butter"],
+        "highlights": ["No refined sugar", "No maida", "Rich in dietary fibre and calcium (from ragi)"],
+        "allergens": ["milk (butter)", "may contain traces of tree nuts", "gluten-free grain base but not certified gluten-free"],
+        "good_for": ["kids", "everyday tea-time", "calcium-conscious buyers"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight; reseal after opening"
+      },
+      {
+        "id": "jowar-biscuits",
+        "name": "Jowar & Jaggery Biscuits",
+        "category_id": "millet",
+        "keywords": ["jowar", "sorghum", "cholam", "jaggery"],
+        "pack_size": "200g",
+        "price": 190,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 4, "price": 190 },
+          { "min_qty": 5, "max_qty": 9, "price": 180 },
+          { "min_qty": 10, "max_qty": null, "price": 170 }
+        ],
+        "sweetener": "Jaggery",
+        "key_ingredients": ["jowar (sorghum) flour", "jaggery", "country cow butter"],
+        "highlights": ["No preservatives", "No maida", "Light, crunchy texture"],
+        "allergens": ["milk (butter)", "may contain traces of tree nuts"],
+        "good_for": ["everyday snacking", "lighter alternative to wheat biscuits"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight; reseal after opening"
+      },
+      {
+        "id": "multimillet-cookies",
+        "name": "Multi-Millet Crunch Cookies",
+        "category_id": "millet",
+        "keywords": ["multi-millet", "multigrain", "5 grain", "five grain", "mixed millet"],
+        "pack_size": "250g",
+        "price": 210,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 4, "price": 210 },
+          { "min_qty": 5, "max_qty": 9, "price": 200 },
+          { "min_qty": 10, "max_qty": null, "price": 190 }
+        ],
+        "sweetener": "Palm jaggery",
+        "key_ingredients": ["5-grain millet blend", "palm jaggery", "country cow butter"],
+        "highlights": ["5-grain blend", "No maida", "No white sugar", "Fibre-rich"],
+        "allergens": ["milk (butter)", "may contain traces of tree nuts"],
+        "good_for": ["families", "variety seekers", "daily nutrition"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight; reseal after opening"
+      },
+      {
+        "id": "quinoa-cookies",
+        "name": "Quinoa Protein Cookies",
+        "category_id": "premium",
+        "keywords": ["quinoa", "protein", "high protein"],
+        "pack_size": "150g",
+        "price": 240,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 4, "price": 240 },
+          { "min_qty": 5, "max_qty": 9, "price": 230 },
+          { "min_qty": 10, "max_qty": null, "price": 220 }
+        ],
+        "sweetener": "Palm jaggery",
+        "key_ingredients": ["quinoa flour", "millet flour", "palm jaggery", "country cow butter"],
+        "highlights": ["Premium, higher-protein recipe", "No maida", "No refined sugar"],
+        "allergens": ["milk (butter)", "may contain traces of tree nuts"],
+        "good_for": ["fitness-focused buyers", "higher-protein snacking", "adults"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight; reseal after opening"
+      },
+      {
+        "id": "oats-cookies",
+        "name": "Toxin-Free Classic Oats Cookies",
+        "category_id": "classic",
+        "keywords": ["oats", "classic", "regular", "plain", "everyday"],
+        "pack_size": "200g",
+        "price": 160,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 4, "price": 160 },
+          { "min_qty": 5, "max_qty": 9, "price": 150 },
+          { "min_qty": 10, "max_qty": null, "price": 140 }
+        ],
+        "sweetener": "Palm jaggery",
+        "key_ingredients": ["rolled oats", "millet flour", "palm jaggery", "country cow butter"],
+        "highlights": ["Best-seller / entry point", "No maida", "No refined sugar", "Familiar mild taste"],
+        "allergens": ["milk (butter)", "oats (may contain gluten)", "may contain traces of tree nuts"],
+        "good_for": ["first-time buyers", "kids", "picky eaters", "gifting sampler"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight; reseal after opening"
+      },
+      {
+        "id": "gift-box",
+        "name": "Ancient Grains Gift Box",
+        "category_id": "gifting",
+        "keywords": ["gift box", "gift", "hamper", "combo", "assorted", "festival", "diwali", "corporate"],
+        "pack_size": "500g mixed / assorted",
+        "price": 520,
+        "bulk_pricing": [
+          { "min_qty": 1, "max_qty": 2, "price": 520 },
+          { "min_qty": 3, "max_qty": null, "price": 490 }
+        ],
+        "key_ingredients": ["assorted mix of our cookie range"],
+        "highlights": ["Assorted mix", "Gifting-ready packaging", "Good for festivals and occasions"],
+        "allergens": ["milk (butter)", "oats", "may contain traces of tree nuts"],
+        "good_for": ["gifting", "festivals", "trying multiple flavours"],
+        "shelf_life": "3 months from manufacture, unopened",
+        "storage": "Cool, dry place away from direct sunlight",
+        "notes": "Bulk / corporate gifting above the standard quantity or with customisation is a human-only request."
+      }
+    ]
+  },
+
+  "policies": {
+    "payments": {
+      "summary": "We accept prepaid online payment only — no Cash on Delivery.",
+      "prepaid_methods": ["UPI", "Debit / Credit card", "Netbanking", "Wallets"],
+      "prepaid_processor": "Razorpay (PCI-DSS compliant). Full card details are never stored on Alimenture servers.",
+      "cod_available": false,
+      "pricing_note": "All prices are in Indian Rupees and include applicable taxes unless stated otherwise. Delivery charges, where applicable, are shown at checkout before you confirm."
+    },
+    "coupons": {
+      "how_to_apply": "Enter the coupon code in the cart or at checkout; the discount preview is shown before payment.",
+      "rules": [
+        "One redemption per customer per coupon",
+        "Each coupon has an overall usage limit and may have an expiry date",
+        "A minimum order value may apply",
+        "Percentage or flat-amount discounts, depending on the coupon",
+        "Cannot be combined unless explicitly stated"
+      ],
+      "bot_note": "The bot can explain how to use a coupon and check whether a code the customer names is valid via the storefront API, but must not invent, generate or extend coupon codes."
+    },
+    "shipping": {
+      "processing_time": "Orders are generally dispatched within 24–48 hours on working days. Orders placed on Sundays or public holidays are processed on the next working day.",
+      "delivery_time": "After dispatch, delivery typically takes 2–7 working days depending on location.",
+      "standard_eta_display": "3–5 business days",
+      "fastest_delivery": "A faster delivery option (approx. 1–2 business days) may be offered at checkout for eligible PIN codes at an additional charge.",
+      "delivery_fee_default": 50,
+      "free_delivery_threshold": 500,
+      "free_delivery_note": "Standard delivery is free on orders at or above ₹500 (subtotal). Below that, a standard delivery fee (around ₹50) applies. The exact fee is PIN-code dependent and always shown at checkout.",
+      "serviceability": "Enter your 6-digit PIN code at checkout to see whether delivery is available, the fee, and the ETA for your area.",
+      "tracking": "Once dispatched, tracking details are sent by SMS and/or email to the contact given on the order. Signed-in customers can also track from 'My Orders' / order tracking page.",
+      "disclaimer": "Delivery timelines are estimates and can be affected by address, courier performance, weather and other factors. The estimate at checkout is not a guaranteed delivery date."
+    },
+    "order_tracking": {
+      "statuses": [
+        { "code": "payment_pending", "customer_label": "Awaiting payment" },
+        { "code": "pending", "customer_label": "Order confirmed" },
+        { "code": "processing", "customer_label": "Being prepared" },
+        { "code": "packed", "customer_label": "Packed" },
+        { "code": "shipped", "customer_label": "Shipped" },
+        { "code": "out_for_delivery", "customer_label": "Out for delivery" },
+        { "code": "delivered", "customer_label": "Delivered" },
+        { "code": "cancelled", "customer_label": "Cancelled" },
+        { "code": "refunded", "customer_label": "Refunded" }
+      ],
+      "how_bot_helps": "Ask for the order number and the email/phone on the order, then look up status via the storefront API. Never read out another customer's order."
+    },
+    "cancellation": {
+      "window": "Orders cannot be cancelled once placed — there is no cancellation window, before or after dispatch.",
+      "how": "There is no self-cancel option and support cannot cancel a placed order. If a payment attempt was never completed (e.g. the payment window was closed or the payment failed), no order was placed and nothing was charged.",
+      "refund": "Cancellation refunds don't apply since orders can't be cancelled. If a delivered item is damaged, wrong, or defective, it may be eligible for a return under the Returns & Refunds Policy."
+    },
+    "returns_refunds": {
+      "eligibility_window_days": 3,
+      "eligible_reasons": ["received damaged", "expired on arrival", "wrong item", "defective on arrival"],
+      "conditions": [
+        "Product must be in original condition and packaging",
+        "Issue reported within 3 days of delivery",
+        "Supporting photos or video of product and packaging provided",
+        "Opened, consumed or post-delivery-damaged items are not eligible unless defective on arrival"
+      ],
+      "how_to_request": "Contact support within 3 days of delivery with your order number, product details, the reason, and photos/video.",
+      "refund_processing": "Once approved (and the product verified where applicable), the refund is initiated to the original payment method or a registered bank account within 7 working days of approval. Time to reflect depends on your bank / payment provider.",
+      "damaged_or_wrong": "For damaged, wrong or tampered items we arrange a replacement or a full refund depending on the case.",
+      "non_returnable": "Food items that are perishable; opened or partially consumed packs; items damaged by improper storage/handling after delivery."
+    },
+    "quality_food_safety": {
+      "statement": "Products are made without maida, refined sugar, refined oil or artificial preservatives, slow-baked in FSSAI-compliant facilities.",
+      "shelf_life_general": "3 months from the manufacturing date, unopened, stored cool and dry.",
+      "packaging_check": "Do not consume if the packaging appears damaged, opened or tampered with — report it within 48 hours with a photo.",
+      "raise_concern": "Contact support with order number, product name, a description, and photos/video of the product and packaging."
+    },
+    "privacy": {
+      "summary": "We collect only what's needed to process and deliver orders and to support you. We do not sell or rent personal data. Payment credentials are handled by the payment provider, not stored by us.",
+      "customer_rights": "You can request access to, correction of, or deletion of your personal information, and opt out of marketing at any time by contacting support. Some records are retained where the law requires.",
+      "full_policy_url": "https://alimenture.com/policy/privacy-policy"
+    },
+    "terms": {
+      "summary": "Every order is an offer to purchase, subject to acceptance and availability. We may decline or cancel for unavailability, pricing/listing errors, suspected fraud or payment failure, refunding any prepaid amount. Products are for personal consumption — check ingredients/allergens if you have restrictions.",
+      "governing_law": "Laws of India; jurisdiction of the courts of Chennai, Tamil Nadu.",
+      "full_policy_url": "https://alimenture.com/policy/terms-of-service"
+    },
+    "policy_urls": {
+      "privacy_policy": "https://alimenture.com/policy/privacy-policy",
+      "terms_of_service": "https://alimenture.com/policy/terms-of-service",
+      "shipping_policy": "https://alimenture.com/policy/shipping-policy",
+      "returns_refunds": "https://alimenture.com/policy/returns-refunds",
+      "cancellation_policy": "https://alimenture.com/policy/cancellation-policy",
+      "quality_guidelines": "https://alimenture.com/policy/quality-guidelines"
+    }
+  },
+
+  "bot_rules": {
+    "identity": "You are the Alimenture support assistant. Be warm, concise, and honest. Use ₹ for prices and Indian English.",
+    "sales_rules": {
+      "max_discount_percent_bot_can_offer": 5,
+      "discount_note": "The bot may only mention discounts up to 5% and only if an active, valid coupon exists. It cannot create codes or change prices.",
+      "orders_above_value_require_human": 10000,
+      "bulk_quantity_requires_human": 10,
+      "cod_high_value_hint": "For very high-value or bulk orders, route to a human and suggest prepaid."
+    },
+    "must_not": [
+      "Make medical, therapeutic, cure, disease-treatment or guaranteed weight-loss claims",
+      "Promise a specific delivery date (only give the checkout estimate range)",
+      "Change prices, waive fees, or invent / extend coupon codes",
+      "Confirm, cancel or modify an order without identity verification (order number + email/phone on the order)",
+      "Share another customer's data or internal/staff information",
+      "Give legal or tax advice beyond the published policy text",
+      "Guess stock, price or serviceability — check the live storefront or say you'll confirm"
+    ],
+    "always": [
+      "Ask for the PIN code before quoting delivery fee or ETA",
+      "Cite the relevant policy in plain language and offer the policy URL",
+      "Offer to connect a human for complaints, refunds, damage, bulk, corporate or negotiation",
+      "Confirm the product, pack size, quantity and total before sending a payment/checkout link",
+      "Stay within working hours expectations for human hand-off"
+    ],
+    "escalation": {
+      "keywords": [
+        "human", "agent", "representative", "real person", "talk to someone", "call me",
+        "complaint", "complain", "refund", "return my money", "not happy", "angry", "worst", "cheated",
+        "damaged", "broken", "wrong item", "missing item", "expired", "stale", "insect", "fungus",
+        "bulk order", "wholesale", "distributor", "reseller", "corporate gifting", "custom order", "customi",
+        "negotiate", "extra discount", "more discount", "best price",
+        "legal", "consumer court", "media", "allergic reaction", "sick", "hospital"
+      ],
+      "action": "Acknowledge, stop selling, and create/route a human hand-off. Capture order number, contact number and a one-line summary.",
+      "safety_override": "Any mention of an allergic reaction, illness, injury or contamination → escalate immediately with high priority, do not attempt to resolve."
+    },
+    "handoff_payload_fields": [
+      "customer_name", "phone", "email", "order_number", "inquiry_type", "issue_summary", "product_ids", "conversation_transcript_id", "priority"
+    ]
+  },
+
+  "conversation": {
+    "widget_inquiry_types": [
+      { "id": "general", "label": "General Query" },
+      { "id": "product", "label": "Product Support" },
+      { "id": "order", "label": "Order & Delivery" },
+      { "id": "person", "label": "Live Specialist" }
+    ],
+    "quick_replies": [
+      "Where is my order?",
+      "Are your products 100% maida free?",
+      "Which snack is best for toddlers?",
+      "What payment options are available?",
+      "Do you deliver to my PIN code?",
+      "How do returns work?"
+    ],
+    "intents": [
+      { "id": "greeting", "examples": ["hi", "hello", "hey"], "response_key": "greeting" },
+      { "id": "browse_products", "examples": ["show products", "what do you sell", "cookies", "menu"], "response_key": "ask_product_in_category" },
+      { "id": "product_info", "examples": ["ingredients in ragi cookies", "is it gluten free", "sugar content", "what's in it"], "response_key": "product_detail" },
+      { "id": "price_quote", "examples": ["price of quinoa cookies", "how much for 5 packs"], "response_key": "quote_and_ask_confirm" },
+      { "id": "place_order", "examples": ["i want to buy", "order 3 packs", "checkout"], "response_key": "ask_details" },
+      { "id": "delivery_check", "examples": ["do you deliver to 600001", "shipping to my area", "delivery charge"], "response_key": "ask_pincode" },
+      { "id": "order_status", "examples": ["track my order", "where is my order", "order not delivered"], "response_key": "ask_order_number" },
+      { "id": "payment_options", "examples": ["do you have COD", "can i pay online", "upi"], "response_key": "payment_options" },
+      { "id": "returns", "examples": ["i want to return", "product damaged", "refund status"], "response_key": "returns_flow" },
+      { "id": "cancel_order", "examples": ["cancel my order", "i changed my mind"], "response_key": "cancellation_flow" },
+      { "id": "bulk_gifting", "examples": ["bulk order", "corporate gifting", "wholesale", "50 boxes"], "response_key": "escalation_ack" },
+      { "id": "talk_to_human", "examples": ["talk to a person", "agent", "call me"], "response_key": "escalation_ack" },
+      { "id": "faq", "examples": ["shelf life", "gst invoice", "are you organic"], "response_key": "faq_answer" },
+      { "id": "fallback", "examples": [], "response_key": "not_understood" }
+    ],
+    "messages": {
+      "greeting": "Hi! Welcome to Alimenture 🌾\n\nWe make toxin-free cookies from ancient grains — no maida, no refined sugar, no preservatives.\n\nWhat can I help with?\n1. Browse cookies\n2. Track an order\n3. Delivery to my PIN code\n4. Talk to a specialist",
+      "ask_product_in_category": "Here's our range:\n• Millet & Grain Cookies — Ragi, Jowar, Multi-Millet\n• Protein & Premium — Quinoa Protein Cookies\n• Everyday Classics — Classic Oats Cookies\n• Gifting — Ancient Grains Gift Box\n\nWhich one would you like to know about?",
+      "product_detail": "{product} ({pack_size}) — ₹{price}/pack.\n{highlights}\nSweetened with {sweetener}. Contains: {allergens}.\nShelf life: {shelf_life}.",
+      "ask_quantity": "Got it — {product} ({pack_size}, ₹{price}/pack). How many packs would you like?",
+      "quote_and_ask_confirm": "{qty} pack(s) of {product} = ₹{subtotal}.\nDelivery is calculated from your PIN code and is free over ₹500.\nShall I help you check out? (yes/no)",
+      "ask_pincode": "Please share your 6-digit PIN code and I'll check delivery availability, the fee and the estimated delivery time for your area.",
+      "delivery_result": "For {pincode}: delivery is {availability}. Fee: {fee}. Estimated delivery: {eta} after dispatch. Orders dispatch in 24–48 working hours.",
+      "ask_details": "Please add items to your cart on the website and check out there for a secure payment — or share:\n\nName:\nPhone:\nDelivery address with PIN code:\n\nand I'll set it up for you.",
+      "payment_options": "You can pay online via UPI, card, netbanking or wallets — all secure, through Razorpay. We don't offer Cash on Delivery. All prices include applicable taxes; GST invoice is provided.",
+      "ask_order_number": "Please share your order number and the email or phone number on the order, and I'll check the status for you.",
+      "order_status_result": "Order {order_number}: {status_label}. {extra}",
+      "returns_flow": "Sorry to hear that. Returns are accepted within 3 days of delivery for items received damaged, expired, wrong or defective. Please share your order number and a photo/video of the product and packaging, and I'll get our team on it.",
+      "cancellation_flow": "Orders can't be cancelled once placed, so I'm not able to cancel this one. If the payment itself didn't go through, no order was placed and nothing was charged. If there's an issue with a delivered item, I can help with a return instead.",
+      "faq_answer": "{answer}",
+      "quotation_created": "Here's your secure checkout link:\n\n{payment_link}\n\nOrder summary:\n• {product} × {qty}\n• Subtotal: ₹{subtotal}\n• Delivery: {delivery_fee}\n• Total: ₹{total}\n\nReference: {ref}. Once paid, you'll get a confirmation here.",
+      "not_understood": "I want to get this right — could you tell me which cookie you're asking about, or whether this is about an existing order?",
+      "escalation_ack": "I understand — let me connect you with one of our team members. Someone will be with you shortly. If it's outside Mon–Sat 9:30 AM–7:00 PM IST, we'll reply on the next working day.",
+      "already_done": "Anything else I can help with? You can browse another product, check delivery, or say 'human' anytime to reach our team.",
+      "safety_escalation": "Thank you for flagging this — I'm escalating it to our team on priority right now. Please stop consuming the product and keep the packaging. Someone will contact you shortly."
+    }
+  },
+
+  "faqs": [
+    { "id": "clean_label", "keywords": ["organic", "chemical free", "toxin free", "preservative", "maida", "refined"], "q": "Are your products really clean-label?", "a": "Yes — all our cookies are baked without maida, refined/white sugar, refined oil or artificial preservatives. We use millets and ancient grains with natural sweeteners like palm jaggery and jaggery." },
+    { "id": "organic_claim", "keywords": ["certified organic", "organic certificate"], "q": "Are you certified organic?", "a": "We focus on toxin-free, clean-label recipes and natural ingredients. We are a registered FSSAI Food Business Operator. For specific certification details, our team can help." },
+    { "id": "ingredients", "keywords": ["ingredients", "what's in it", "whats in it", "recipe"], "q": "What are the ingredients?", "a": "Each product page lists full ingredients. Tell me which product you're interested in and I'll share its ingredient highlights, sweetener and allergen info." },
+    { "id": "gluten", "keywords": ["gluten", "gluten free", "wheat", "celiac"], "q": "Are the cookies gluten-free?", "a": "Our base grains (ragi, jowar, millets, quinoa) are naturally gluten-free, but products are not certified gluten-free and oats-based items may contain gluten. If you have coeliac disease or a serious allergy, please check with our team first." },
+    { "id": "diabetic", "keywords": ["diabetic", "diabetes", "sugar free", "sugar content", "gi", "glycemic"], "q": "Are these good for diabetics?", "a": "Our cookies use natural sweeteners (palm jaggery / jaggery) instead of refined sugar and are made from whole millets, which many people prefer as a lower-GI option. They still contain natural sugars and are not a sugar-free or medical product — please consult your doctor for your specific needs." },
+    { "id": "kids", "keywords": ["toddler", "toddlers", "kids", "children", "baby", "child"], "q": "Which snack is best for kids?", "a": "Parents most often choose our Ragi Ancient Grain Cookies (calcium and fibre from ragi) and the Classic Oats Cookies (mild, familiar taste). All are made without maida, white sugar or preservatives. They do contain milk (butter) and may contain traces of nuts." },
+    { "id": "allergens", "keywords": ["allergy", "allergen", "nuts", "dairy", "milk", "egg"], "q": "Do your products contain allergens?", "a": "Our cookies contain milk (country cow butter) and may contain traces of tree nuts; oats items may contain gluten. They are egg-free. Full allergen info is on each product page — please check before buying if you have allergies." },
+    { "id": "shelf_life", "keywords": ["shelf life", "expiry", "how long does it last", "best before"], "q": "What is the shelf life?", "a": "Our cookies stay fresh for 3 months from the manufacturing date, unopened, stored in a cool dry place. Reseal the pack after opening and consume within a few days." },
+    { "id": "delivery_time", "keywords": ["delivery time", "shipping time", "how long to deliver", "when will i get"], "q": "How long does delivery take?", "a": "Orders dispatch within 24–48 working hours. After dispatch, delivery usually takes 2–7 working days depending on your location (checkout shows an estimate for your PIN code). A faster 1–2 day option may be available for some PIN codes at extra cost." },
+    { "id": "delivery_fee", "keywords": ["delivery charge", "shipping fee", "free delivery", "free shipping"], "q": "What are the delivery charges?", "a": "Standard delivery is free on orders of ₹500 or more. Below that, a small delivery fee (around ₹50, PIN-code dependent) applies and is always shown at checkout." },
+    { "id": "payment", "keywords": ["cash on delivery", "cod", "payment", "upi", "card", "netbanking", "pay online"], "q": "What payment options are available?", "a": "You can pay online via UPI, card, netbanking or wallets through our secure gateway (Razorpay). We don't offer Cash on Delivery." },
+    { "id": "track", "keywords": ["track", "tracking", "where is my order", "order status"], "q": "How do I track my order?", "a": "After dispatch we send tracking by SMS and/or email. Signed-in customers can also track from the order tracking page. Share your order number and I can check the status." },
+    { "id": "return", "keywords": ["return", "exchange", "damaged", "defect", "wrong item"], "q": "What is your return policy?", "a": "Because these are food items, returns are accepted within 3 days of delivery only for products received damaged, expired, wrong or defective. Share your order number and photos/video and our team will arrange a replacement or refund." },
+    { "id": "refund_time", "keywords": ["refund time", "money back", "how long refund"], "q": "How long do refunds take?", "a": "Approved refunds are initiated within 7 working days of approval to your original payment method or a registered bank account. Time to reflect depends on your bank." },
+    { "id": "cancel", "keywords": ["cancel", "cancellation", "changed my mind"], "q": "Can I cancel my order?", "a": "No, orders cannot be cancelled once placed — this applies before and after dispatch. If a delivered item is damaged, wrong, or defective, you can raise a return instead." },
+    { "id": "gst", "keywords": ["gst", "invoice", "bill", "tax invoice"], "q": "Do you provide a GST invoice?", "a": "Yes, a GST invoice is issued with every order and available on request." },
+    { "id": "bulk", "keywords": ["bulk", "wholesale", "distributor", "corporate", "gifting order", "large order"], "q": "Do you take bulk or corporate orders?", "a": "Yes — bulk, wholesale and corporate gifting are handled by our team directly. I'll connect you with a specialist who can share pricing and customisation." },
+    { "id": "stores", "keywords": ["store", "offline", "retail", "where to buy", "shop near me"], "q": "Are your products available in stores?", "a": "We sell primarily online at alimenture.com. For retail availability or stockist enquiries, our team can help." },
+    { "id": "international", "keywords": ["international", "abroad", "outside india", "usa", "export"], "q": "Do you ship internationally?", "a": "We currently ship within India only. For export or overseas enquiries, please contact our team." }
+  ],
+
+  "runtime_data_the_bot_needs": {
+    "from_storefront_api": [
+      "live product list: id, name, price, pack size, in-stock flag, product page URL",
+      "active coupons the customer is eligible for (code, type, value, min order, expiry)",
+      "PIN-code serviceability: deliverable flag, standard fee, standard ETA, fastest option + fee + ETA",
+      "order lookup by order number + verified contact: current status, status history, tracking URL, items, totals",
+      "cart / checkout link generation for an assisted order"
+    ],
+    "from_this_file": [
+      "brand story, features, philosophy, compliance",
+      "policy text (shipping, returns, cancellation, privacy, terms, quality)",
+      "product descriptions, ingredients, allergens, use-cases",
+      "FAQs",
+      "bot rules, escalation keywords, conversation messages"
+    ],
+    "session_context_to_track": [
+      "authenticated (yes/no) and customer name/email if signed in",
+      "inquiry_type chosen in the widget",
+      "current product/category in focus",
+      "PIN code once provided",
+      "order number once provided and whether identity is verified",
+      "escalation_triggered flag"
+    ]
+  }
+}

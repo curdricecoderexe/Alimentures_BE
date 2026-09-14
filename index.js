@@ -43,6 +43,16 @@ if (missingEnvs.length > 0) {
   process.exit(1);
 }
 
+// Transactional email (OTP, password reset) is disabled without SMTP creds — warn
+// loudly at boot rather than silently returning "code sent" for mail that never goes out.
+const smtpMissing = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'].filter((e) => !process.env[e]);
+if (smtpMissing.length > 0) {
+  log.warn('boot.smtp_not_configured', {
+    missing: smtpMissing,
+    note: 'Registration OTP and password-reset emails will NOT be delivered.',
+  });
+}
+
 // Number of proxy hops in front of the app, so req.ip / rate-limit keys resolve
 // to the real client IP. 1 = a single nginx (or Render). 2 = Cloudflare -> nginx.
 // Set TRUST_PROXY_HOPS to match your edge. Never leave this higher than reality:
@@ -80,7 +90,7 @@ if (process.env.LOG_LEVEL !== 'silent') {
 // best-effort guess and may not match the real production frontend domain.
 const DEV_ORIGINS = ['http://localhost:5173', 'http://localhost:3000'];
 const PROD_ORIGINS = [
-  'https://alimenture.netlify.app',
+  'https://alimentures.netlify.app',
   'https://alimenture.com',
   'https://www.alimenture.com',
 ];
@@ -111,7 +121,9 @@ app.use('/api/orders/razorpay/webhook', express.raw({ type: '*/*', limit: '1mb' 
 // item thumbnails, delivery proof-of-delivery photos). The first parser to
 // populate req.body wins.
 const largeJson = express.json({ limit: LIMITS.JSON_BODY_WITH_IMAGE });
-['/api/products', '/api/super-grains', '/api/hero-slides', '/api/settings', '/api/orders']
+['/api/products', '/api/super-grains', '/api/hero-slides', '/api/settings', '/api/orders',
+  '/api/appearance', // customisable background images
+  '/api/admin/delivery'] // CSV / bulk PIN-code import payloads
   .forEach((p) => app.use(p, largeJson));
 
 app.use(express.json({ limit: LIMITS.JSON_BODY }));
@@ -145,6 +157,9 @@ const wishlistRoutes = require("./routes/wishlistRoutes");
 const reviewRoutes = require("./routes/reviewRoutes");
 const cartRoutes = require("./routes/cartRoutes");
 const clientErrorRoutes = require("./routes/clientErrorRoutes");
+const deliveryRoutes = require("./routes/deliveryRoutes");
+const adminDeliveryRoutes = require("./routes/adminDeliveryRoutes");
+const appearanceRoutes = require("./routes/appearanceRoutes");
 
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
@@ -161,6 +176,9 @@ app.use("/api/wishlist", wishlistRoutes);
 app.use("/api/reviews", reviewRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/client-errors", clientErrorRoutes);
+app.use("/api/delivery", deliveryRoutes);
+app.use("/api/admin/delivery", adminDeliveryRoutes);
+app.use("/api/appearance", appearanceRoutes);
 
 // ─── 9. HEALTH ────────────────────────────────────────────────────────────────
 const db = require('./config/firebase');
@@ -187,6 +205,7 @@ const io = new Server(server, {
 
 const { chatSocket } = require("./controllers/chatController");
 chatSocket(io); // installs the token-required handshake middleware
+app.set('io', io); // lets REST routes (e.g. chat close/reopen) push socket events
 
 // ─── 12. PROCESS SAFETY NETS ──────────────────────────────────────────────────
 process.on('unhandledRejection', (reason) => {

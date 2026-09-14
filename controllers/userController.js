@@ -104,23 +104,100 @@ exports.loginUser = async (req, res) => {
     }
 
     if (!isActive) {
-      return res.status(403).json({ 
-        success: false, 
-        error: "Your account has been deactivated. Please contact support." 
+      return res.status(403).json({
+        success: false,
+        error: "Your account has been deactivated. Please contact support."
       });
     }
-    
+
+    // Password verified. Every login (any role) must also clear an OTP step
+    // before a token is handed out — stash the signed-in session server-side
+    // and release it only once verifyLoginOtp confirms the code.
+    const otp = await issueOtp("login_otps", email);
+
+    // The pending-session write and the OTP email are independent — fire them
+    // together instead of waiting on one before starting the other.
+    const [, emailResult] = await Promise.all([
+      db.collection("login_pending").doc(email).set({
+        token: data.idToken,
+        uid: data.localId,
+        role,
+        name,
+        email: data.email || email,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }),
+      sendMail(
+        email,
+        "Your Login OTP - Alimenture",
+        `Your one-time login code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
+        `<div style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
+           <h2>Verify it's you</h2>
+           <p>Your One-Time Password (OTP) to complete sign-in is:</p>
+           <h1 style="color: #E83D6E; letter-spacing: 5px;">${otp}</h1>
+           <p>Enter this code to finish signing in. If you didn't try to log in, you can ignore this email.</p>
+         </div>`
+      ),
+    ]);
+
+    if (!emailResult.success) {
+      log.error("otp.login_email_failed", { requestId: req.id, err: emailResult.error });
+      return res.status(502).json({
+        error: "We couldn't send the verification code right now. Please try again in a moment.",
+      });
+    }
+
     return res.status(200).json({
       success: true,
-      token: data.idToken,
-      uid: data.localId,
-      role: role,
-      name: name,
+      otpRequired: true,
       email: data.email || email,
-      message: "Login successful"
+      message: "Enter the OTP sent to your email to complete login.",
     });
   } catch (err) {
     console.error("Error in loginUser:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+// POST /api/users/login/verify-otp — second factor after loginUser. Releases
+// the pending session (token/uid/role/name) that loginUser stashed once the
+// OTP mailed to the account is confirmed.
+exports.verifyLoginOtp = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) {
+      return res.status(400).json({ error: "Email and OTP are required" });
+    }
+
+    const pendingRef = db.collection("login_pending").doc(email);
+
+    // The OTP check and the pending-session lookup don't depend on each
+    // other — run them together instead of two round-trips back to back.
+    const [result, pendingSnap] = await Promise.all([
+      verifyOtp("login_otps", email, String(otp)),
+      pendingRef.get(),
+    ]);
+
+    if (!result.ok) {
+      const status = result.reason === "locked" ? 429 : 400;
+      return res.status(status).json({ error: OTP_ERROR_MESSAGE[result.reason] || "Invalid OTP" });
+    }
+    if (!pendingSnap.exists) {
+      return res.status(400).json({ error: "Login session expired. Please sign in again." });
+    }
+    const pending = pendingSnap.data();
+    pendingRef.delete().catch(() => {}); // best-effort cleanup, don't block the response
+
+    return res.status(200).json({
+      success: true,
+      token: pending.token,
+      uid: pending.uid,
+      role: pending.role,
+      name: pending.name,
+      email: pending.email,
+      message: "Login successful",
+    });
+  } catch (err) {
+    console.error("Error in verifyLoginOtp:", err);
     return res.status(500).json({ error: "Internal server error" });
   }
 };
@@ -145,11 +222,10 @@ exports.logoutUser = async (req, res) => {
 };
 
 exports.sendRegisterOtp = async (req, res) => {
-  // Same response whether or not the email is already registered — no enumeration oracle.
   const generic = { success: true, message: "If that email can be registered, a verification code has been sent." };
   try {
-    const { email } = req.body;
-    if (!email || typeof email !== "string") return res.status(400).json({ error: "Email is required" });
+    const email = String(req.body.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: "Email is required" });
 
     let alreadyRegistered = false;
     try {
@@ -163,22 +239,14 @@ exports.sendRegisterOtp = async (req, res) => {
     }
 
     if (alreadyRegistered) {
-      // Don't send a registration OTP for an existing account, and don't leak
-      // that fact in the response — send a helpful "you already have an account"
-      // email instead.
-      sendMail(
-        email,
-        "You already have an Alimenture account",
-        "Someone tried to register with this email. If it was you, just sign in — or use 'Forgot password' to reset it. If it wasn't you, you can ignore this.",
-        `<div style="font-family: Arial, sans-serif; padding: 20px;">
-           <h2>You already have an account</h2>
-           <p>Someone just tried to register with this email address. If that was you, simply
-              <a href="${process.env.DOMAIN || ''}/login">sign in</a>.</p>
-           <p>Forgotten your password? Use the "Forgot password" link on the sign-in page.</p>
-           <p>If this wasn't you, you can safely ignore this email.</p>
-         </div>`
-      );
-      return res.status(200).json(generic);
+      // Tell the user directly — a "code sent" screen they can never complete is
+      // worse UX than a clear "you already have an account". (This trades away
+      // the account-existence oracle on this endpoint; the tighter otpLimiter
+      // still caps probing.)
+      return res.status(409).json({
+        error: "This email is already registered. Please sign in instead.",
+        alreadyRegistered: true,
+      });
     }
 
     // Hashed, expiring, attempt-limited OTP (utils/otp)
@@ -196,8 +264,10 @@ exports.sendRegisterOtp = async (req, res) => {
     );
 
     if (!emailResult.success) {
-      // Still don't leak — log server-side and return the generic response.
       log.error("otp.register_email_failed", { requestId: req.id, err: emailResult.error });
+      return res.status(502).json({
+        error: "We couldn't send the verification code right now. Please try again in a moment.",
+      });
     }
 
     return res.status(200).json(generic);
@@ -208,7 +278,8 @@ exports.sendRegisterOtp = async (req, res) => {
 };
 
 exports.createUser = async (req, res) => {
-  const { email, password, name, otp, role } = req.body;
+  const { password, name, otp, role } = req.body;
+  const email = String(req.body.email || "").trim().toLowerCase();
   const isRequesterAdmin = req.user && req.user.role?.toLowerCase() === 'admin';
 
   if (!email || !password || !name) {
@@ -308,36 +379,14 @@ exports.getUsers = async (req, res) => {
   }
 };
 
-exports.getDeliveryPersons = async (req, res) => {
-  try {
-    const snapshot = await db.collection("users")
-      .where("role", "==", "delivery")
-      .where("isActive", "==", true)
-      .get();
-
-    // Projection — assignment UI only needs id + name.
-    const users = snapshot.docs.map((doc) => ({
-      uid: doc.id,
-      name: doc.data().name || "Delivery",
-    }));
-
-    return res.status(200).json({
-      success: true,
-      count: users.length,
-      data: users
-    });
-  } catch (err) {
-    console.error("Error in getDeliveryPersons:", err);
-    return res.status(500).json({ success: false, error: "Failed to fetch delivery persons" });
-  }
-};
 exports.getUser = async (req, res) => {
   try {
     const { uid } = req.params;
-    
-    // IDOR Protection
+
+    // IDOR Protection — staff can look up a customer's profile (needed for
+    // support-chat context), same read access admin already has.
     const role = req.user?.role?.toLowerCase();
-    if (role !== 'admin' && req.user?.uid !== uid) {
+    if (!['admin', 'staff'].includes(role) && req.user?.uid !== uid) {
       return res.status(403).json({ error: "Forbidden: You do not have access to this user profile" });
     }
 
@@ -392,7 +441,7 @@ exports.setUserRole = async (req, res) => {
   try {
     const { uid } = req.params;
     const newRole = String(req.body.role || '').toLowerCase();
-    if (!['admin', 'staff', 'delivery', 'customer'].includes(newRole)) {
+    if (!['admin', 'staff', 'customer'].includes(newRole)) {
       return res.status(400).json({ error: "Invalid role" });
     }
     if (uid === req.user.uid && newRole !== 'admin') {
@@ -477,7 +526,7 @@ exports.deleteUser = async (req, res) => {
 };
 exports.requestPasswordResetOtp = async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = String(req.body.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Email is required" });
 
     // Generic response regardless of whether the account exists (no enumeration).
@@ -492,7 +541,7 @@ exports.requestPasswordResetOtp = async (req, res) => {
 
     if (userExists) {
       const otp = await issueOtp("password_otps", email);
-      await sendMail(
+      const emailResult = await sendMail(
         email,
         "Password Reset OTP - Alimenture",
         `Your password reset code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
@@ -503,17 +552,25 @@ exports.requestPasswordResetOtp = async (req, res) => {
            <p>This code expires in 10 minutes. Do not share it with anyone.</p>
          </div>`
       );
+      if (!emailResult.success) {
+        log.error("otp.reset_email_failed", { requestId: req.id, err: emailResult.error });
+        return res.status(502).json({
+          error: "We couldn't send the reset code right now. Please try again in a moment.",
+        });
+      }
     }
 
     return res.status(200).json(genericOk);
   } catch (err) {
+    log.error("otp.reset_request_failed", { requestId: req.id, err });
     return res.status(500).json({ error: "Internal server error" });
   }
 };
 
 exports.resetPasswordWithOtp = async (req, res) => {
   try {
-    const { email, otp, newPassword } = req.body;
+    const { otp, newPassword } = req.body;
+    const email = String(req.body.email || "").trim().toLowerCase();
     if (!email || !otp || !newPassword) return res.status(400).json({ error: "All fields are required" });
     if (typeof newPassword !== "string" || newPassword.length < 8) {
       return res.status(400).json({ error: "Password must be at least 8 characters" });

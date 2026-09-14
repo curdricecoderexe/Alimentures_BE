@@ -83,6 +83,10 @@ exports.chatSocket = (io) => {
           socket.emit("chat_error", { error: "Not authorised for this chat" });
           return;
         }
+        if (chatDoc.data().status === "closed") {
+          socket.emit("chat_error", { error: "This ticket is closed. Reopen it to keep chatting." });
+          return;
+        }
 
         // Sender identity is ALWAYS derived from the verified socket user.
         const message = {
@@ -165,6 +169,76 @@ exports.getChatSession = async (req, res, next) => {
       messages,
       truncated: msgsSnapshot.size === CHAT_HISTORY_LIMIT,
     });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// GET /api/chat/my-chats  (any authenticated customer) — the caller's own
+// tickets, newest-first, so the widget can resume an open one or list history
+// instead of losing track of it after the widget is closed / the page reloads.
+exports.getMyChats = async (req, res, next) => {
+  try {
+    const snapshot = await db.collection("chats")
+      .where("ownerUid", "==", req.user.uid)
+      .limit(50)
+      .get();
+    const chats = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    chats.sort((a, b) => {
+      const at = a.updatedAt?._seconds || a.updatedAt?.seconds || 0;
+      const bt = b.updatedAt?._seconds || b.updatedAt?.seconds || 0;
+      return bt - at;
+    });
+    return res.status(200).json({ success: true, data: chats });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PUT /api/chat/:chatId/close  (owner or staff/admin) — resolves the ticket.
+exports.closeChat = async (req, res, next) => {
+  try {
+    const { chatId } = req.params;
+    const chatRef = db.collection("chats").doc(chatId);
+    const doc = await chatRef.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: "Chat not found" });
+    if (!canAccessChat(req.user, doc.data())) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
+    }
+    if (doc.data().status === "closed") {
+      return res.status(200).json({ success: true, message: "Already closed" });
+    }
+    await chatRef.update({
+      status: "closed",
+      closedBy: req.user.uid,
+      closedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    req.app.get('io')?.to(chatId).emit("chat_status", { status: "closed" });
+    return res.status(200).json({ success: true, message: "Ticket closed" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PUT /api/chat/:chatId/reopen  (owner or staff/admin) — sends the ticket back
+// into the pending queue so staff can pick it up again.
+exports.reopenChat = async (req, res, next) => {
+  try {
+    const { chatId } = req.params;
+    const chatRef = db.collection("chats").doc(chatId);
+    const doc = await chatRef.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: "Chat not found" });
+    if (!canAccessChat(req.user, doc.data())) {
+      return res.status(403).json({ success: false, error: "Forbidden" });
+    }
+    await chatRef.update({
+      status: "pending",
+      assignedTo: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    req.app.get('io')?.to(chatId).emit("chat_status", { status: "pending" });
+    return res.status(200).json({ success: true, message: "Ticket reopened" });
   } catch (err) {
     next(err);
   }

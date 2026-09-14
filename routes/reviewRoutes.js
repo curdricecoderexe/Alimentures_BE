@@ -6,7 +6,7 @@ const {
   deleteReview,
   getProductReviews,
   getAdminReviews,
-  moderateReview,
+  getMyReviews,
   adminDeleteReview
 } = require("../controllers/reviewController");
 
@@ -17,12 +17,12 @@ const { reviewLimiter } = require("../middlewares/rateLimiters");
 // Public
 router.get("/product/:productId", getProductReviews);
 
-// Admin Moderation
+// Admin (view + spam removal — reviews go live immediately, no approval queue)
 router.get("/admin", verifyToken, isAdmin, getAdminReviews);
-router.patch("/admin/:id/status", verifyToken, isAdmin, moderateReview);
 router.delete("/admin/:id", verifyToken, isAdmin, adminDeleteReview);
 
 // Customer
+router.get("/mine", verifyToken, getMyReviews);
 router.post("/", verifyToken, reviewLimiter, createReview);
 router.put("/:id", verifyToken, reviewLimiter, updateReview);
 router.delete("/:id", verifyToken, deleteReview);

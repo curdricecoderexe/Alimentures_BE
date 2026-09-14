@@ -37,17 +37,26 @@ async function createTransporter() {
   log.warn('email.using_ethereal', { user: testAccount.user });
 }
 
-const sendMail = async (to, subject, text, html) => {
+/**
+ * @param {string} to
+ * @param {string} subject
+ * @param {string} text            plain-text fallback
+ * @param {string} [html]          rich HTML body
+ * @param {Array}  [attachments]   nodemailer attachment objects
+ *                                 (e.g. inline product images via `cid`, or a PDF invoice)
+ */
+const sendMail = async (to, subject, text, html, attachments) => {
   try {
     await createTransporter();
     if (!transporterReady) return { success: false, error: 'email_not_configured' };
 
     const info = await transporter.sendMail({
-      from: `"Alimentures" <${process.env.SMTP_USER || 'updates@ethereal.email'}>`,
+      from: `"Alimenture" <${process.env.SMTP_USER || 'updates@ethereal.email'}>`,
       to,
       subject,
       text,
       html: html || `<p>${text}</p>`,
+      ...(attachments && attachments.length ? { attachments } : {}),
     });
     if (process.env.NODE_ENV !== 'production') {
       log.info('email.sent', { to, subject, preview: nodemailer.getTestMessageUrl(info) || undefined });

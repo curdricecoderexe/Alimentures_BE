@@ -10,20 +10,14 @@ const {
   updateOrderStatus,
   getOrdersByEmail,
   getMyOrders,
-  assignDeliveryPerson,
-  acceptRejectDelivery,
-  addOrderFeedback,
-  getAllFeedbacks,
   cleanupExpiredReservations,
-  cancelOrder,
-  cancelOrderAdmin,
+  abandonPayment,
   refundOrder
 } = require("../controllers/orderController");
 
 const verifyToken = require("../middlewares/verifyToken");
 const isAdmin = require("../middlewares/isAdmin");
 const isStaff = require("../middlewares/isStaff");
-const isStaffOrDelivery = require("../middlewares/isStaffOrDelivery");
 const { orderLimiter } = require("../middlewares/rateLimiters");
 const cronOrAdmin = require("../middlewares/cronAuth");
 
@@ -35,24 +29,20 @@ router.post("/razorpay/webhook", razorpayWebhook);
 router.post("/cleanup-reservations", cronOrAdmin, cleanupExpiredReservations);
 
 router.post("/", verifyToken, orderLimiter, createOrder);
-router.get("/", verifyToken, isStaffOrDelivery, getOrders);
-router.get("/user/:email", verifyToken, isStaffOrDelivery, getOrdersByEmail);
+router.get("/", verifyToken, isStaff, getOrders);
+router.get("/user/:email", verifyToken, isStaff, getOrdersByEmail);
 router.get("/my-orders", verifyToken, getMyOrders);
-router.get("/all/feedbacks", verifyToken, isAdmin, getAllFeedbacks);
 router.get("/:id", verifyToken, getOrderById);
 
-// Fulfilment status (staff / delivery) — cancellation & refunds are separate.
-router.put("/:id/status", verifyToken, isStaffOrDelivery, updateOrderStatus);
+// Fulfilment status (staff) — refunds are separate. Orders cannot
+// be cancelled once placed — see abandon-payment below for the one exception.
+router.put("/:id/status", verifyToken, isStaff, updateOrderStatus);
 
-// Cancellation
-router.put("/:id/cancel", verifyToken, cancelOrder);                    // customer, own order
-router.post("/:id/cancel-admin", verifyToken, isAdmin, cancelOrderAdmin); // admin, any order
+// Releases the stock reservation for an order that never got past payment
+// (still `payment_pending`) — not a general cancellation route.
+router.put("/:id/abandon-payment", verifyToken, abandonPayment);
 
 // Refund (admin only)
 router.post("/:id/refund", verifyToken, isAdmin, refundOrder);
-
-router.patch("/:id/assign", verifyToken, isStaff, assignDeliveryPerson);
-router.put("/:id/accept-delivery", verifyToken, isStaffOrDelivery, acceptRejectDelivery);
-router.post("/:id/feedback", verifyToken, addOrderFeedback);
 
 module.exports = router;
