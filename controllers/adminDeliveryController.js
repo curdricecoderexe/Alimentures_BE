@@ -13,11 +13,11 @@ const log = require('../lib/logger');
 const { createAuditLog } = require('../services/auditService');
 const locationService = require('../services/locationService');
 const {
-  getGlobalSettings, normaliseSettings, invalidateSettingsCache, clampFee, isValidPincode,
+  getGlobalSettings, normaliseSettings, invalidateSettingsCache, clampFee, isValidPincode, standardFeeTypeOf,
 } = require('../services/deliveryService');
 const {
   PINCODE_COLLECTION, SETTINGS_COLLECTION, SETTINGS_DOC,
-  FEE_MIN, FEE_MAX, CSV_HEADERS, BULK_MAX_ROWS, PINCODE_RE,
+  FEE_MIN, FEE_MAX, CSV_HEADERS, BULK_MAX_ROWS, PINCODE_RE, STANDARD_FEE_TYPES,
 } = require('../config/deliveryConstants');
 
 const LIST_MAX = 500;
@@ -88,6 +88,22 @@ function cleanPincodePayload(body, { partial = false } = {}) {
     if (r !== null) out[dst] = r;
   }
 
+  // Standard fee mode: 'default' follows the global default fee, 'custom' charges
+  // standardDeliveryFee (₹0 = free). Callers without an explicit mode (CSV) use
+  // blank fee → default, any number → custom.
+  if (!partial || body.standardFeeType !== undefined || body.deliveryFee !== undefined) {
+    let type = body.standardFeeType;
+    if (type !== undefined && !STANDARD_FEE_TYPES.includes(type)) {
+      return { error: `standardFeeType must be one of: ${STANDARD_FEE_TYPES.join(', ')}` };
+    }
+    if (type === undefined) {
+      const raw = body.deliveryFee;
+      type = (raw === '' || raw == null) ? 'default' : 'custom';
+    }
+    out.standardFeeType = type;
+    if (type === 'default') out.standardDeliveryFee = 0;
+  }
+
   if (!partial || body.standardEta !== undefined) out.standardDeliveryEta = str(body.standardEta, 60);
   if (!partial || body.fastestEta !== undefined) out.fastestDeliveryEta = str(body.fastestEta, 60);
   if (!partial || body.note !== undefined) out.note = str(body.note, 300);
@@ -132,7 +148,7 @@ exports.listPincodes = async (req, res) => {
     let query = db.collection(PINCODE_COLLECTION);
     if (state && locationService.isValidState(state)) query = query.where('state', '==', state);
     const snap = await query.limit(LIST_MAX).get();
-    let rows = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    let rows = snap.docs.map((d) => ({ id: d.id, ...d.data(), standardFeeType: standardFeeTypeOf(d.data()) }));
 
     const q = String(search).trim().toLowerCase();
     if (q) rows = rows.filter((r) => r.pincode.includes(q) || (r.cityLower || '').includes(q) || (r.stateLower || '').includes(q));
@@ -447,7 +463,7 @@ exports.exportCsv = async (req, res) => {
       const o = d.data();
       lines.push([
         o.pincode, o.city || '', o.state || '',
-        o.deliveryAvailable ? 'true' : 'false', o.standardDeliveryFee || 0,
+        o.deliveryAvailable ? 'true' : 'false', standardFeeTypeOf(o) === 'custom' ? (o.standardDeliveryFee || 0) : '',
         o.fastestDeliveryAvailable ? 'true' : 'false', o.fastestDeliveryFee || 0,
         o.standardDeliveryEta || '', o.fastestDeliveryEta || '', o.note || '',
       ].map(esc).join(','));

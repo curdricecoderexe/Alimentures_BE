@@ -3,6 +3,7 @@ const app = express();
 require("dotenv").config();
 const cors = require("cors");
 const helmet = require("helmet");
+const compression = require("compression");
 const morgan = require("morgan");
 const { v4: uuidv4 } = require("uuid");
 const rateLimit = require("express-rate-limit");
@@ -53,6 +54,18 @@ if (smtpMissing.length > 0) {
   });
 }
 
+// Shiprocket is optional — without it, orders are fulfilled manually via status updates.
+const shiprocketMissing = ['SHIPROCKET_EMAIL', 'SHIPROCKET_PASSWORD', 'SHIPROCKET_PICKUP_LOCATION', 'SHIPROCKET_PICKUP_PINCODE']
+  .filter((e) => !process.env[e]);
+if (shiprocketMissing.length > 0) {
+  log.warn('boot.shiprocket_not_configured', {
+    missing: shiprocketMissing,
+    note: 'Shiprocket shipping is DISABLED — PIN serviceability checks and automatic shipment creation are off.',
+  });
+} else if (!process.env.SHIPROCKET_WEBHOOK_TOKEN) {
+  log.warn('boot.shiprocket_webhook_not_configured', { note: 'Set SHIPROCKET_WEBHOOK_TOKEN to receive live tracking updates.' });
+}
+
 // Number of proxy hops in front of the app, so req.ip / rate-limit keys resolve
 // to the real client IP. 1 = a single nginx (or Render). 2 = Cloudflare -> nginx.
 // Set TRUST_PROXY_HOPS to match your edge. Never leave this higher than reality:
@@ -69,6 +82,9 @@ app.use(helmet({
     },
   },
 }));
+
+// gzip JSON responses — catalogue payloads carry inline base64 images.
+app.use(compression());
 
 // ─── 3. REQUEST ID (server-generated only — inbound header is ignored) ─────────
 app.use((req, res, next) => {
@@ -141,6 +157,19 @@ const globalLimiter = rateLimit({
 });
 app.use("/api", globalLimiter);
 
+// Let browsers briefly reuse anonymous catalogue reads (storefront browsing).
+// Signed-in requests can see drafts/private items, so they are never cached.
+const PUBLIC_CACHE_PATHS = ['/api/products', '/api/hero-slides', '/api/super-grains', '/api/appearance'];
+app.use(PUBLIC_CACHE_PATHS, (req, res, next) => {
+  if (req.method === 'GET' && !req.headers.authorization) {
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+  } else {
+    res.set('Cache-Control', 'private, no-store');
+  }
+  res.vary('Authorization');
+  next();
+});
+
 // ─── 8. ROUTES ────────────────────────────────────────────────────────────────
 const productRoutes = require("./routes/productRoutes");
 const userRoutes = require("./routes/userRoutes");
@@ -160,6 +189,7 @@ const clientErrorRoutes = require("./routes/clientErrorRoutes");
 const deliveryRoutes = require("./routes/deliveryRoutes");
 const adminDeliveryRoutes = require("./routes/adminDeliveryRoutes");
 const appearanceRoutes = require("./routes/appearanceRoutes");
+const shippingRoutes = require("./routes/shippingRoutes");
 
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
@@ -179,6 +209,7 @@ app.use("/api/client-errors", clientErrorRoutes);
 app.use("/api/delivery", deliveryRoutes);
 app.use("/api/admin/delivery", adminDeliveryRoutes);
 app.use("/api/appearance", appearanceRoutes);
+app.use("/api/shipping", shippingRoutes);
 
 // ─── 9. HEALTH ────────────────────────────────────────────────────────────────
 const db = require('./config/firebase');

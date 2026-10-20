@@ -4,6 +4,7 @@ const { sendMail } = require('../utils/mailer');
 const { buildOrderEmail } = require('../utils/emailTemplates');
 const { buildInvoicePdf } = require('../utils/invoicePdf');
 const { computeDeliveryFee, isValidPincode, DeliveryError } = require('../services/deliveryService');
+const { autoCreateShipment } = require('../services/shippingService');
 const { DELIVERY_METHODS } = require('../config/deliveryConstants');
 const { createNotification } = require('./notificationController');
 const Razorpay = require('razorpay');
@@ -57,6 +58,7 @@ async function sendOrderEmail(orderId, kind, extra = {}) {
     log.warn('order.email_failed', { orderId, kind, err });
   }
 }
+exports.sendOrderEmail = sendOrderEmail; // reused by the Shiprocket tracking flow
 
 function computeDiscount(coupon, subtotal) {
   if (coupon.discountType === 'percentage') {
@@ -313,6 +315,11 @@ exports.cleanupExpiredReservations = async (req, res) => {
 
     let count = 0;
     for (const doc of snapshot.docs) {
+      const { orderId } = doc.data();
+      if (orderId) {
+        const oDoc = await db.collection("orders").doc(orderId).get();
+        if (oDoc.exists && await reconcileRazorpayOrder(orderId, oDoc.data())) continue;
+      }
       await releaseReservation(doc.id, 'EXPIRED');
       count++;
     }
@@ -385,7 +392,13 @@ async function ordersForEmail(email, req, res) {
   const docs = await runOrdered(ordered, filtered.limit(500), {
     orderField: 'createdAt', dir: 'desc', limit, requestId: req.id,
   });
-  const orders = docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+  const orders = await Promise.all(docs.map(async (doc) => {
+    const data = doc.data();
+    if (await reconcileRazorpayOrder(doc.id, data)) {
+      return { id: doc.id, ...(await db.collection("orders").doc(doc.id).get()).data() };
+    }
+    return { id: doc.id, ...data };
+  }));
   return res.status(200).json({
     success: true,
     count: orders.length,
@@ -435,6 +448,10 @@ exports.getOrderById = async (req, res) => {
       return res.status(403).json({ success: false, error: "Forbidden: You do not have access to this order" });
     }
 
+    if (await reconcileRazorpayOrder(doc.id, orderData)) {
+      const fresh = await db.collection("orders").doc(doc.id).get();
+      return res.status(200).json({ success: true, data: { id: doc.id, ...fresh.data() } });
+    }
     return res.status(200).json({ success: true, data: { id: doc.id, ...orderData } });
   } catch (err) {
     console.error("GET ORDER BY ID ERROR:", err);
@@ -762,6 +779,13 @@ exports.verifyRazorpay = async (req, res) => {
     return res.status(200).json({ success: true, message: "Payment verified and order confirmed" });
   } catch (error) {
     log.error("order.verify_razorpay_failed", { requestId: req.id, err: error });
+    const orderId = req.body?.orderId;
+    if (orderId) {
+      const oDoc = await db.collection("orders").doc(String(orderId)).get().catch(() => null);
+      if (oDoc?.exists && await reconcileRazorpayOrder(oDoc.id, oDoc.data())) {
+        return res.status(200).json({ success: true, message: "Payment confirmed" });
+      }
+    }
     return res.status(500).json({ success: false, error: "Payment verification failed" });
   }
 };
@@ -834,10 +858,13 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     incrementSalesAnalytics(t, oData, 'razorpay');
-    confirmedData = oData;
+    confirmedData = { ...oData, status: newOrderStatus };
   });
 
   if (!confirmedData) return; // someone else already confirmed
+
+  // Push in-stock paid orders to Shiprocket (no-op when Shiprocket isn't configured).
+  if (confirmedData.status === 'pending') autoCreateShipment(orderId);
 
   const short = `#${orderId.slice(-6).toUpperCase()}`;
   sendOrderEmail(orderId, 'paid');
@@ -848,6 +875,26 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
     createNotification(confirmedData.userId, 'Payment Successful', `Your order ${short} has been confirmed.`);
   }
   log.info('order.razorpay_confirmed', { orderId, source });
+}
+
+/**
+ * Ask Razorpay whether a still-`payment_pending` order was actually paid, and
+ * confirm it if so. Covers a lost browser verify call when the webhook can't
+ * reach us (e.g. local dev) — without it a paid order would later be cancelled
+ * by the reservation cleanup. Returns true when the order is (now) paid.
+ */
+async function reconcileRazorpayOrder(orderId, oData) {
+  if (!oData || oData.status !== 'payment_pending' || !oData.razorpayOrderId) return false;
+  try {
+    const { items = [] } = await razorpay.orders.fetchPayments(oData.razorpayOrderId);
+    const paid = items.find((p) => p.status === 'captured');
+    if (!paid) return false;
+    await confirmRazorpayPayment(orderId, paid.id, 'reconcile');
+    return true;
+  } catch (err) {
+    log.warn('order.razorpay_reconcile_failed', { orderId, err });
+    return false;
+  }
 }
 
 /**
@@ -1049,6 +1096,9 @@ exports.abandonPayment = async (req, res) => {
     if (order.userId !== req.user.uid) return res.status(403).json({ success: false, error: "Access denied" });
     if (order.status !== 'payment_pending') {
       return res.status(400).json({ success: false, error: "Order is not an unpaid pending payment" });
+    }
+    if (await reconcileRazorpayOrder(id, order)) {
+      return res.status(200).json({ success: true, paid: true, message: "Payment already received — order confirmed" });
     }
     if (order.reservationId) {
       await releaseReservation(order.reservationId, 'RELEASED');

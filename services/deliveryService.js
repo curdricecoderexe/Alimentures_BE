@@ -17,6 +17,7 @@
 
 const db = require('../config/firebase');
 const log = require('../lib/logger');
+const shiprocket = require('./shiprocketService');
 const {
   DEFAULT_SETTINGS, SETTINGS_COLLECTION, SETTINGS_DOC, PINCODE_COLLECTION,
   PINCODE_RE, FEE_MIN, FEE_MAX,
@@ -26,6 +27,15 @@ const {
 
 let _cache = { at: 0, value: null };
 const SETTINGS_TTL_MS = 60 * 1000;
+
+/**
+ * A PIN rule's standard fee mode. Rules saved before `standardFeeType` existed
+ * stored a blank fee as 0 (shown as "Default" in admin), so treat 0 as default.
+ */
+function standardFeeTypeOf(rule) {
+  if (rule.standardFeeType === 'default' || rule.standardFeeType === 'custom') return rule.standardFeeType;
+  return Number(rule.standardDeliveryFee) > 0 ? 'custom' : 'default';
+}
 
 function clampFee(n, fallback) {
   const v = Number(n);
@@ -99,6 +109,39 @@ async function getPincodeRule(pincode) {
   }
 }
 
+/* ── Shiprocket courier serviceability (short-lived in-process cache) ───── */
+
+const _serviceCache = new Map();
+const SERVICE_TTL_MS = 6 * 60 * 60 * 1000;
+const SERVICE_CACHE_MAX = 5000;
+
+/**
+ * Can a Shiprocket courier deliver to this PIN?
+ * @returns {Promise<{ serviceable: boolean, eta: string|null }|null>} null = unknown
+ *   (Shiprocket disabled or unreachable) — callers then fall back to the admin config.
+ */
+async function getCourierServiceability(pincode) {
+  if (!shiprocket.isEnabled()) return null;
+  const hit = _serviceCache.get(pincode);
+  if (hit && Date.now() - hit.at < SERVICE_TTL_MS) return hit.value;
+  try {
+    const r = await shiprocket.checkServiceability({ deliveryPincode: pincode });
+    let eta = null;
+    if (r.serviceable) {
+      const rec = r.couriers.find((c) => c.courierId === r.recommendedId) || r.couriers[0];
+      // Courier transit days + our 1–2 working-day dispatch window (see Shipping Policy).
+      if (rec?.estimatedDays) eta = `${rec.estimatedDays + 1}–${rec.estimatedDays + 2} business days`;
+    }
+    const value = { serviceable: r.serviceable, eta };
+    if (_serviceCache.size >= SERVICE_CACHE_MAX) _serviceCache.delete(_serviceCache.keys().next().value);
+    _serviceCache.set(pincode, { at: Date.now(), value });
+    return value;
+  } catch (err) {
+    log.warn('delivery.shiprocket_serviceability_failed', { pincode, err });
+    return null; // fail open — an outage must not block checkout
+  }
+}
+
 /* ── the resolver ──────────────────────────────────────────────────────── */
 
 /**
@@ -150,14 +193,21 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
       return out;
     }
     out.standard.available = true;
-    out.standard.fee = clampFee(
-      rule.standardDeliveryFee != null ? rule.standardDeliveryFee : settings.defaultDeliveryFee,
-      settings.defaultDeliveryFee,
-    );
+    out.standard.fee = standardFeeTypeOf(rule) === 'custom'
+      ? clampFee(rule.standardDeliveryFee, settings.defaultDeliveryFee)
+      : settings.defaultDeliveryFee;
     if (rule.standardDeliveryEta) out.standard.eta = String(rule.standardDeliveryEta).slice(0, 60);
   } else if (settings.serviceByDefault) {
+    // No admin rule for this PIN → ask our courier partner (Shiprocket) whether it
+    // is serviceable. An explicit admin PIN rule always takes precedence.
+    const courier = pin ? await getCourierServiceability(pin) : null;
+    if (courier && !courier.serviceable) {
+      out.reason = 'Our courier partners do not deliver to this PIN code yet.';
+      return out;
+    }
     out.standard.available = true;
     out.standard.fee = settings.defaultDeliveryFee;
+    if (courier?.eta) out.standard.eta = courier.eta;
   } else {
     out.reason = 'Delivery is currently unavailable for this PIN code.';
     return out;
@@ -254,5 +304,6 @@ module.exports = {
   isValidPincode,
   normalisePincode,
   clampFee,
+  standardFeeTypeOf,
   DeliveryError,
 };

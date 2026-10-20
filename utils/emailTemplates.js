@@ -254,7 +254,12 @@ function buildOrderEmail({ order, orderId, kind, status, refundAmount }) {
     return null;
   });
 
-  const statusLine = '';
+  // Courier + AWB once a Shiprocket shipment is in motion.
+  const sh = order.shipment || {};
+  const inTransit = isDelivery && ['shipped', 'out_for_delivery'].includes(String(status || '').toLowerCase());
+  const statusLine = inTransit && sh.awb
+    ? `Courier: <strong>${esc(sh.courierName || 'Our courier partner')}</strong> · AWB <strong>${esc(sh.awb)}</strong>`
+    : '';
 
   const payLabel = ci.paymentMethod === 'razorpay' ? 'Paid online' : 'Cash on delivery';
   const trackUrl = `${SITE_URL}/orders`;
@@ -336,6 +341,7 @@ function buildOrderEmail({ order, orderId, kind, status, refundAmount }) {
     `${ev.heading} — Order ${sid}`,
     fmtDate(order.createdAt),
     kind === 'status' ? `Status: ${STATUS_LABEL[status] || status}` : '',
+    inTransit && sh.awb ? `Courier: ${sh.courierName || 'Our courier partner'} · AWB ${sh.awb}` : '',
     kind === 'refunded' && refundAmount ? `Refund amount: ${money(refundAmount)}` : '',
     '',
     ...items.map((it) => `  • ${it.name} (${it.selectedWeight || 'Standard'}) x${it.quantity} — ${money((it.price || 0) * (it.quantity || 1))}`),

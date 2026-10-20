@@ -13,6 +13,9 @@ const PINCODE_RE = /^[1-9][0-9]{5}$/; // Indian PIN: 6 digits, no leading zero
 
 const DELIVERY_METHODS = Object.freeze(['standard', 'fastest']);
 
+// Per-PIN standard fee mode: follow the global default, or a custom amount.
+const STANDARD_FEE_TYPES = Object.freeze(['default', 'custom']);
+
 const FEE_MIN = 0;
 const FEE_MAX = 5000; // hard ceiling — protects against fat-finger / manipulation
 
@@ -48,6 +51,7 @@ const BULK_MAX_ROWS = 5000; // per import / bulk request
 module.exports = {
   PINCODE_RE,
   DELIVERY_METHODS,
+  STANDARD_FEE_TYPES,
   FEE_MIN,
   FEE_MAX,
   DEFAULT_SETTINGS,

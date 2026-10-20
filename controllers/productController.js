@@ -42,10 +42,22 @@ const publicProduct = (obj) => {
   return copy;
 };
 
+// Product lists (cards) only need the main image. The extra photos are inline
+// base64 and made public list payloads ~2× larger; the details page reads them
+// from GET /products/:id.
+const LIST_ONLY_OMIT = ['secondaryImage', 'tertiaryImage', 'images'];
+const publicListProduct = (obj) => {
+  const copy = publicProduct(obj);
+  for (const f of LIST_ONLY_OMIT) delete copy[f];
+  return copy;
+};
+
 // --- In-Memory Search Cache ---
 let productCache = [];
 let cacheTimestamp = 0;
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+// Short TTL: cached products carry stock ("Sold out"), which orders change
+// without invalidating the cache.
+const CACHE_TTL = 60 * 1000;
 
 const SEARCH_CACHE_LIMIT = 2000; // beyond this the catalogue needs a real search service
 
@@ -188,7 +200,7 @@ exports.searchProducts = async (req, res) => {
     const finalData = paginated.map(p => {
       const copy = { ...p };
       delete copy._score;
-      return staff ? copy : publicProduct(copy);
+      return staff ? copy : publicListProduct(copy);
     });
 
     return res.status(200).json({
@@ -221,6 +233,9 @@ const validateProduct = (data, isUpdate = false) => {
     for (let variant of data.variants) {
       if (variant.price !== undefined && Number(variant.price) < 0) return `Variant price for ${variant.weight} cannot be negative`;
       if (variant.stock !== undefined && Number(variant.stock) < 0) return `Variant stock for ${variant.weight} cannot be negative`;
+      if (variant.mrp != null && variant.mrp !== '' && !(Number(variant.mrp) > Number(variant.price || 0))) {
+        return `MRP for ${variant.weight} must be higher than its selling price`;
+      }
     }
   }
 
@@ -275,6 +290,22 @@ exports.getProducts = async (req, res) => {
 
     // Non-staff callers may request more from Firestore since drafts/private are
     // filtered out afterwards; over-fetch a little then trim.
+    // Public first page: serve from the in-memory catalogue cache instead of a
+    // multi-MB Firestore read on every storefront visit.
+    if (!staff && !lastId) {
+      if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+      const products = productCache
+        .filter(p => p.isDraft !== true && p.isPrivate !== true)
+        .slice(0, limit)
+        .map(publicListProduct);
+      return res.status(200).json({
+        success: true,
+        count: products.length,
+        lastId: products.length > 0 ? products[products.length - 1].id : null,
+        data: products
+      });
+    }
+
     const fetchLimit = staff ? limit : Math.min(LIMITS.LIST_LIMIT_MAX, limit * 2);
     let query = db.collection("products").orderBy("createdAt", "desc").limit(fetchLimit);
 
@@ -290,7 +321,7 @@ exports.getProducts = async (req, res) => {
       products = products
         .filter(p => p.isDraft !== true && p.isPrivate !== true)
         .slice(0, limit)
-        .map(publicProduct);
+        .map(publicListProduct);
     }
 
     return res.status(200).json({
@@ -470,4 +501,4 @@ exports.updateProductStock = async (req, res) => {
     log.error("product.stock_update_failed", { requestId: req.id, err });
     return res.status(500).json({ success: false, error: "Failed to update stock" });
   }
-};
+};

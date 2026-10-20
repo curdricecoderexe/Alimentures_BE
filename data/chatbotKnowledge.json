@@ -217,7 +217,7 @@
       "bot_note": "The bot can explain how to use a coupon and check whether a code the customer names is valid via the storefront API, but must not invent, generate or extend coupon codes."
     },
     "shipping": {
-      "processing_time": "Orders are generally dispatched within 24–48 hours on working days. Orders placed on Sundays or public holidays are processed on the next working day.",
+      "processing_time": "Orders are generally handed to the courier within 1–2 working days of payment. Orders placed on Sundays or public holidays are processed on the next working day.",
       "delivery_time": "After dispatch, delivery typically takes 2–7 working days depending on location.",
       "standard_eta_display": "3–5 business days",
       "fastest_delivery": "A faster delivery option (approx. 1–2 business days) may be offered at checkout for eligible PIN codes at an additional charge.",
@@ -225,7 +225,11 @@
       "free_delivery_threshold": 500,
       "free_delivery_note": "Standard delivery is free on orders at or above ₹500 (subtotal). Below that, a standard delivery fee (around ₹50) applies. The exact fee is PIN-code dependent and always shown at checkout.",
       "serviceability": "Enter your 6-digit PIN code at checkout to see whether delivery is available, the fee, and the ETA for your area.",
-      "tracking": "Once dispatched, tracking details are sent by SMS and/or email to the contact given on the order. Signed-in customers can also track from 'My Orders' / order tracking page.",
+      "delivery_partner": "Orders ship through Shiprocket (Bigfoot Retail Solutions Pvt. Ltd.), which assigns one of its partner couriers (e.g. Delhivery, Blue Dart, Xpressbees, Ekart, DTDC) based on PIN-code serviceability. A specific courier can't be guaranteed.",
+      "tracking": "Once a courier is assigned the order gets an AWB (tracking) number. Customers can track it on the 'My Orders' page (courier name, AWB, live scans), via the Shiprocket tracking link, and through SMS / email / WhatsApp updates from Shiprocket or the courier.",
+      "delivery_attempts": "Couriers usually make up to 3 delivery attempts — keep your phone reachable. Undeliverable shipments (customer unavailable, wrong address/phone, refused) are returned to us (RTO). For customer-side RTOs we refund the order value minus forward and return shipping, or re-ship on payment of re-delivery charges; if the RTO was our or the courier's fault we re-ship or refund in full.",
+      "address_change": "The delivery address can only be changed before a courier/AWB is assigned — contact support quickly with the order number.",
+      "lost_or_damaged": "Damaged or tampered packages: refuse or note it with the agent, then contact support within 3 days with photos/unboxing video. Shipments confirmed lost in transit are re-shipped or refunded in full.",
       "disclaimer": "Delivery timelines are estimates and can be affected by address, courier performance, weather and other factors. The estimate at checkout is not a guaranteed delivery date."
     },
     "order_tracking": {
