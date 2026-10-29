@@ -107,8 +107,8 @@ if (process.env.LOG_LEVEL !== 'silent') {
 const DEV_ORIGINS = ['http://localhost:5173', 'http://localhost:3000'];
 const PROD_ORIGINS = [
   'https://alimentures.netlify.app',
-  'https://alimenture.com',
-  'https://www.alimenture.com',
+  'https://alimenture.in',
+  'https://www.alimenture.in',
 ];
 const allowedOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean)
