@@ -1,4 +1,5 @@
 const db = require('../config/firebase');
+const { publicImageUrl, publicBase, PUBLIC_STOCK_CAP } = require('./productController');
 
 exports.validateCart = async (req, res) => {
   try {
@@ -9,9 +10,11 @@ exports.validateCart = async (req, res) => {
     }
 
     if (items.length === 0) {
+      // An empty cart is never a valid order (createOrder rejects it too).
       return res.json({
         success: true,
-        valid: true,
+        valid: false,
+        error: 'Your cart is empty',
         items: [],
         subtotal: 0,
         shipping: 0,
@@ -120,9 +123,9 @@ exports.validateCart = async (req, res) => {
         ...item,
         name: product.name,
         price: authoritativePrice,
-        image: product.image || item.image,
+        image: product.image ? publicImageUrl(publicBase(req), item.productId, product, 'main') : item.image,
         category: product.category,
-        stock: stock
+        stock: Math.min(Number(stock) || 0, PUBLIC_STOCK_CAP)
       });
     }
 

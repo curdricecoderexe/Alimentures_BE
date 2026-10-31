@@ -13,7 +13,7 @@
 
 'use strict';
 
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 
 function resolveServiceAccount() {
   const envJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;

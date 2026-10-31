@@ -1,7 +1,7 @@
 'use strict';
 
 const db = require('../config/firebase');
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 const log = require('../lib/logger');
 const { createAuditLog } = require('../services/auditService');
 const {

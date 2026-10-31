@@ -1,4 +1,4 @@
-const admin = require("firebase-admin");
+const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const { sendMail } = require('../utils/mailer');
 const { buildOrderEmail } = require('../utils/emailTemplates');
@@ -1206,4 +1206,54 @@ exports.refundOrder = async (req, res) => {
 
 // NOTE: hard-deleting orders is intentionally NOT exposed — orders are financial
 // records. Use cancel / refund instead.
+
+// DELETE /orders/:id  (admin) — permanently removes a CLOSED order. Active paid
+// orders must be cancelled or refunded first (which restores stock and money);
+// an unpaid `payment_pending` order is checked with Razorpay and its stock
+// reservation released before it goes.
+const DELETABLE_STATUSES = ['cancelled', 'refunded', 'payment_failed', 'failed', 'payment_pending'];
+
+exports.deleteOrder = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const docRef = db.collection("orders").doc(id);
+    const snap = await docRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: "Order not found" });
+    const order = snap.data();
+    const status = String(order.status || '').toLowerCase();
+
+    if (!DELETABLE_STATUSES.includes(status)) {
+      return res.status(409).json({
+        success: false,
+        error: "Only cancelled, refunded, failed or unpaid orders can be deleted. Cancel or refund this order first.",
+      });
+    }
+    if (status === 'payment_pending') {
+      if (await reconcileRazorpayOrder(id, order)) {
+        return res.status(409).json({ success: false, error: "Payment for this order has just been received — it can't be deleted." });
+      }
+      if (order.reservationId) await releaseReservation(order.reservationId, 'RELEASED');
+    }
+
+    await docRef.delete();
+    createAuditLog({
+      adminId: req.user?.uid,
+      adminEmail: req.user?.email || 'unknown',
+      action: 'DELETE_ORDER',
+      resourceId: id,
+      previousState: {
+        status: order.status,
+        totalAmount: order.totalAmount,
+        customer: order.customerInfo?.email || order.userEmail || null,
+        itemCount: (order.items || []).length,
+      },
+      newState: null,
+      ipAddress: req.ip,
+    });
+    return res.status(200).json({ success: true, message: "Order deleted" });
+  } catch (err) {
+    log.error('order.delete_failed', { requestId: req.id, orderId: req.params.id, err });
+    return res.status(500).json({ success: false, error: "Failed to delete order" });
+  }
+};
 

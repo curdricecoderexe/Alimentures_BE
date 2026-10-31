@@ -12,7 +12,8 @@ const {
   getMyOrders,
   cleanupExpiredReservations,
   abandonPayment,
-  refundOrder
+  refundOrder,
+  deleteOrder,
 } = require("../controllers/orderController");
 
 const verifyToken = require("../middlewares/verifyToken");
@@ -44,5 +45,8 @@ router.put("/:id/abandon-payment", verifyToken, abandonPayment);
 
 // Refund (admin only)
 router.post("/:id/refund", verifyToken, isAdmin, refundOrder);
+
+// Admin: permanently delete a closed (cancelled / refunded / failed / unpaid) order.
+router.delete("/:id", verifyToken, isAdmin, deleteOrder);
 
 module.exports = router;

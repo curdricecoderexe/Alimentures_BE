@@ -1,5 +1,5 @@
 const db = require('../config/firebase');
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 
 const WRITABLE = ['src', 'title', 'subtitle', 'ctaText', 'ctaLink', 'order'];
 

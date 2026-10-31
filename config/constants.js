@@ -64,6 +64,11 @@ const LIMITS = Object.freeze({
   IMAGE_MAX_BYTES: 900 * 1024,
   IMAGE_MIME_ALLOW: ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'],
 
+  // Homepage film — raw upload, chunked into Firestore and held in memory to stream.
+  VIDEO_MAX_BYTES: 40 * 1024 * 1024,
+  // Downloadable catalogue PDF — raw upload, chunked into Firestore.
+  CATALOGUE_MAX_BYTES: 25 * 1024 * 1024,
+
   // Cart / order
   ITEM_QTY_MIN: 1,
   ITEM_QTY_MAX: 50,

@@ -1,6 +1,14 @@
-const admin = require("firebase-admin");
+const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const { sendMail } = require("../utils/mailer");
+const { buildOtpEmail } = require("../utils/emailTemplates");
+const { setSessionCookies, clearSessionCookies } = require("../lib/session");
+
+/** Branded OTP email (same layout as every other site email). */
+const sendOtpEmail = (to, purpose, otp) => {
+  const { subject, text, html } = buildOtpEmail({ purpose, otp });
+  return sendMail(to, subject, text, html);
+};
 const log = require("../lib/logger");
 const { issueOtp, verifyOtp, OTP_ERROR_MESSAGE } = require("../utils/otp");
 const { LIMITS } = require("../config/constants");
@@ -120,23 +128,15 @@ exports.loginUser = async (req, res) => {
     const [, emailResult] = await Promise.all([
       db.collection("login_pending").doc(email).set({
         token: data.idToken,
+        refreshToken: data.refreshToken || null,
+        expiresIn: Number(data.expiresIn) || 3600,
         uid: data.localId,
         role,
         name,
         email: data.email || email,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       }),
-      sendMail(
-        email,
-        "Your Login OTP - Alimenture",
-        `Your one-time login code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
-        `<div style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
-           <h2>Verify it's you</h2>
-           <p>Your One-Time Password (OTP) to complete sign-in is:</p>
-           <h1 style="color: #E83D6E; letter-spacing: 5px;">${otp}</h1>
-           <p>Enter this code to finish signing in. If you didn't try to log in, you can ignore this email.</p>
-         </div>`
-      ),
+      sendOtpEmail(email, "login", otp),
     ]);
 
     if (!emailResult.success) {
@@ -187,9 +187,18 @@ exports.verifyLoginOtp = async (req, res) => {
     const pending = pendingSnap.data();
     pendingRef.delete().catch(() => {}); // best-effort cleanup, don't block the response
 
+    // The code was emailed to this address, so ownership is now proven.
+    await db.collection("users").doc(pending.uid).set({ emailVerified: true }, { merge: true });
+    invalidateUser(pending.uid);
+    admin.auth().updateUser(pending.uid, { emailVerified: true }).catch((err) =>
+      log.warn("user.email_verify_flag_failed", { uid: pending.uid, err }));
+
+    // Session lives in httpOnly cookies — page scripts never see the tokens.
+    setSessionCookies(res, { idToken: pending.token, refreshToken: pending.refreshToken, expiresIn: pending.expiresIn });
+
     return res.status(200).json({
       success: true,
-      token: pending.token,
+      session: "cookie",
       uid: pending.uid,
       role: pending.role,
       name: pending.name,
@@ -202,8 +211,11 @@ exports.verifyLoginOtp = async (req, res) => {
   }
 };
 
-// POST /api/users/logout — invalidate every existing token for this user.
+// POST /api/users/logout — clear the session cookies and invalidate every
+// existing token for this user (works even if the session already expired).
 exports.logoutUser = async (req, res) => {
+  clearSessionCookies(res);
+  if (!req.user) return res.status(200).json({ success: true, message: "Signed out" });
   try {
     const uid = req.user.uid;
     await Promise.all([
@@ -251,17 +263,7 @@ exports.sendRegisterOtp = async (req, res) => {
 
     // Hashed, expiring, attempt-limited OTP (utils/otp)
     const otp = await issueOtp("otps", email);
-    const emailResult = await sendMail(
-      email,
-      "Your Registration OTP - Alimenture",
-      `Your one-time registration code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
-      `<div style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
-         <h2>Welcome to Alimenture!</h2>
-         <p>Your One-Time Password (OTP) for registration is:</p>
-         <h1 style="color: #E83D6E; letter-spacing: 5px;">${otp}</h1>
-         <p>Please enter this code to complete your registration. Do not share this code with anyone.</p>
-       </div>`
-    );
+    const emailResult = await sendOtpEmail(email, "register", otp);
 
     if (!emailResult.success) {
       log.error("otp.register_email_failed", { requestId: req.id, err: emailResult.error });
@@ -316,6 +318,9 @@ exports.createUser = async (req, res) => {
       email,
       password,
       displayName: name,
+      // Self-registration proved inbox control with the emailed code; accounts
+      // an admin creates are verified on their first (emailed-code) sign-in.
+      emailVerified: !isRequesterAdmin,
     });
 
     
@@ -324,6 +329,7 @@ exports.createUser = async (req, res) => {
       email,
       role: isRequesterAdmin ? (role || "customer") : "customer",
       isActive: true,
+      emailVerified: !isRequesterAdmin,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -541,17 +547,7 @@ exports.requestPasswordResetOtp = async (req, res) => {
 
     if (userExists) {
       const otp = await issueOtp("password_otps", email);
-      const emailResult = await sendMail(
-        email,
-        "Password Reset OTP - Alimenture",
-        `Your password reset code is ${otp}. It expires in 10 minutes. Do not share it with anyone.`,
-        `<div style="font-family: Arial, sans-serif; text-align: center; padding: 20px;">
-           <h2>Reset Your Password</h2>
-           <p>Your OTP for password reset is:</p>
-           <h1 style="color: #E83D6E; letter-spacing: 5px;">${otp}</h1>
-           <p>This code expires in 10 minutes. Do not share it with anyone.</p>
-         </div>`
-      );
+      const emailResult = await sendOtpEmail(email, "reset", otp);
       if (!emailResult.success) {
         log.error("otp.reset_email_failed", { requestId: req.id, err: emailResult.error });
         return res.status(502).json({

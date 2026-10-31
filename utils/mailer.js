@@ -44,8 +44,9 @@ async function createTransporter() {
  * @param {string} [html]          rich HTML body
  * @param {Array}  [attachments]   nodemailer attachment objects
  *                                 (e.g. inline product images via `cid`, or a PDF invoice)
+ * @param {object} [extra]         extra nodemailer options (e.g. { headers })
  */
-const sendMail = async (to, subject, text, html, attachments) => {
+const sendMail = async (to, subject, text, html, attachments, extra = {}) => {
   try {
     await createTransporter();
     if (!transporterReady) return { success: false, error: 'email_not_configured' };
@@ -57,6 +58,7 @@ const sendMail = async (to, subject, text, html, attachments) => {
       text,
       html: html || `<p>${text}</p>`,
       ...(attachments && attachments.length ? { attachments } : {}),
+      ...extra,
     });
     if (process.env.NODE_ENV !== 'production') {
       log.info('email.sent', { to, subject, preview: nodemailer.getTestMessageUrl(info) || undefined });

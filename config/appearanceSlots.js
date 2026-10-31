@@ -42,6 +42,27 @@ const APPEARANCE_SLOTS = [
     ratio: '16 / 9',
   },
   {
+    key: 'lineupImage1',
+    label: 'Alchemi’s — Image 1',
+    group: 'Alchemi’s (Clean Snack Lineup)',
+    hint: 'Main photo beside “Clean Snack Lineup”. Portrait or square works best.',
+    ratio: '4 / 5',
+  },
+  {
+    key: 'lineupImage2',
+    label: 'Alchemi’s — Image 2',
+    group: 'Alchemi’s (Clean Snack Lineup)',
+    hint: 'Optional. With two or more images set, the frame crossfades between them.',
+    ratio: '4 / 5',
+  },
+  {
+    key: 'lineupImage3',
+    label: 'Alchemi’s — Image 3',
+    group: 'Alchemi’s (Clean Snack Lineup)',
+    hint: 'Optional third slide for the crossfade.',
+    ratio: '4 / 5',
+  },
+  {
     key: 'catalogAllBg',
     label: 'Catalog — All Products',
     group: 'Catalog categories',

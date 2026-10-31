@@ -7,8 +7,31 @@
 const log = require('../lib/logger');
 const locationService = require('../services/locationService');
 const {
-  resolveDeliveryOptions, isValidPincode, normalisePincode, getPincodeRule,
+  resolveDeliveryOptions, isValidPincode, normalisePincode, getPincodeRule, getGlobalSettings,
 } = require('../services/deliveryService');
+
+/**
+ * GET /api/delivery/summary — the storefront's shipping messaging
+ * ("Free shipping above ₹X"), straight from Admin → PIN Code Delivery.
+ */
+exports.getDeliverySummary = async (req, res) => {
+  try {
+    const s = await getGlobalSettings();
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
+    res.json({
+      success: true,
+      data: {
+        freeDeliveryEnabled: s.freeDeliveryEnabled,
+        freeDeliveryThreshold: s.freeDeliveryThreshold,
+        defaultDeliveryFee: s.defaultDeliveryFee,
+        standardEta: s.defaultStandardEta,
+      },
+    });
+  } catch (err) {
+    log.error('delivery.summary_failed', { requestId: req.id, err });
+    res.status(500).json({ success: false, error: 'Failed to load delivery details' });
+  }
+};
 
 /** GET /api/delivery/locations/states */
 exports.getStates = (req, res) => {

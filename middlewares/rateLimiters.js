@@ -16,7 +16,7 @@ const MIN = 60 * 1000;
 const json = (msg) => ({ success: false, error: msg });
 
 const base = {
-  standardHeaders: true,
+  standardHeaders: false,
   legacyHeaders: false,
 };
 

@@ -1,5 +1,5 @@
 const db = require('../config/firebase');
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 
 /**
  * Creates an audit log for sensitive admin operations

@@ -1,4 +1,4 @@
-const admin = require("firebase-admin");
+const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 
 const validateSuperGrain = (data, isUpdate = false) => {

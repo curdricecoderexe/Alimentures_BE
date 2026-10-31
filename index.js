@@ -21,6 +21,12 @@ process.env.NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PROD = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
 
+// Supported runtimes (package.json "engines", .nvmrc). Others may work but are untested.
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+if (NODE_MAJOR < 20 || NODE_MAJOR > 24) {
+  log.warn('boot.unsupported_node', { version: process.versions.node, supported: '20–24 (use the .nvmrc version)' });
+}
+
 const requiredEnvs = [
   "PORT",
   "FIREBASE_SERVICE_ACCOUNT_JSON",
@@ -71,6 +77,8 @@ if (shiprocketMissing.length > 0) {
 // Set TRUST_PROXY_HOPS to match your edge. Never leave this higher than reality:
 // an over-count lets a client spoof X-Forwarded-For and bypass rate limits.
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1);
+// Plain key=value query strings only — no `q[$ne]=` style nested objects.
+app.set('query parser', 'simple');
 
 // ─── 2. SECURITY HEADERS ──────────────────────────────────────────────────────
 app.use(helmet({
@@ -143,7 +151,16 @@ const largeJson = express.json({ limit: LIMITS.JSON_BODY_WITH_IMAGE });
   .forEach((p) => app.use(p, largeJson));
 
 app.use(express.json({ limit: LIMITS.JSON_BODY }));
-app.use(express.urlencoded({ extended: true, limit: LIMITS.JSON_BODY }));
+app.use(express.urlencoded({ extended: false, limit: LIMITS.JSON_BODY }));
+
+// Input-shape guards (see middlewares/requestGuards.js).
+const { rejectOperatorQuery, requireJsonBody } = require('./middlewares/requestGuards');
+app.use('/api', rejectOperatorQuery);
+app.use('/api', requireJsonBody([
+  { path: /^\/api\/orders\/razorpay\/webhook$/, types: /.*/ },            // raw bytes for HMAC
+  { path: /^\/api\/catalogue\/admin\/file$/, types: /^application\/pdf\b/ }, // catalogue upload
+  { path: /^\/api\/shipping\/webhook$/, types: /^application\/(json|x-www-form-urlencoded)\b/ },
+]));
 
 // ─── 7. RATE LIMITING ─────────────────────────────────────────────────────────
 // A generous catch-all; the tight per-route limiters (middlewares/rateLimiters.js)
@@ -152,7 +169,8 @@ const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.GLOBAL_RATE_MAX) || 1000,
   message: { success: false, error: "Too many requests from this IP, please try again later." },
-  standardHeaders: true,
+  // Don't advertise the limit/remaining budget; a 429 still carries Retry-After.
+  standardHeaders: false,
   legacyHeaders: false,
 });
 app.use("/api", globalLimiter);
@@ -160,13 +178,17 @@ app.use("/api", globalLimiter);
 // Let browsers briefly reuse anonymous catalogue reads (storefront browsing).
 // Signed-in requests can see drafts/private items, so they are never cached.
 const PUBLIC_CACHE_PATHS = ['/api/products', '/api/hero-slides', '/api/super-grains', '/api/appearance'];
+const { ID_COOKIE, REFRESH_COOKIE } = require('./lib/session');
 app.use(PUBLIC_CACHE_PATHS, (req, res, next) => {
-  if (req.method === 'GET' && !req.headers.authorization) {
+  const cookies = req.headers.cookie || '';
+  const signedIn = req.headers.authorization || cookies.includes(`${ID_COOKIE}=`) || cookies.includes(`${REFRESH_COOKIE}=`);
+  if (req.method === 'GET' && !signedIn) {
     res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
   } else {
     res.set('Cache-Control', 'private, no-store');
   }
   res.vary('Authorization');
+  res.vary('Cookie');
   next();
 });
 
@@ -190,6 +212,10 @@ const deliveryRoutes = require("./routes/deliveryRoutes");
 const adminDeliveryRoutes = require("./routes/adminDeliveryRoutes");
 const appearanceRoutes = require("./routes/appearanceRoutes");
 const shippingRoutes = require("./routes/shippingRoutes");
+const homeVideoRoutes = require("./routes/homeVideoRoutes");
+const categoryRoutes = require("./routes/categoryRoutes");
+const catalogueRoutes = require("./routes/catalogueRoutes");
+const newsletterRoutes = require("./routes/newsletterRoutes");
 
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
@@ -210,6 +236,10 @@ app.use("/api/delivery", deliveryRoutes);
 app.use("/api/admin/delivery", adminDeliveryRoutes);
 app.use("/api/appearance", appearanceRoutes);
 app.use("/api/shipping", shippingRoutes);
+app.use("/api/home-video", homeVideoRoutes);
+app.use("/api/categories", categoryRoutes);
+app.use("/api/catalogue", catalogueRoutes);
+app.use("/api/newsletter", newsletterRoutes);
 
 // ─── 9. HEALTH ────────────────────────────────────────────────────────────────
 const db = require('./config/firebase');
@@ -237,6 +267,7 @@ const io = new Server(server, {
 const { chatSocket } = require("./controllers/chatController");
 chatSocket(io); // installs the token-required handshake middleware
 app.set('io', io); // lets REST routes (e.g. chat close/reopen) push socket events
+app.set('allowedOrigins', allowedOrigins);
 
 // ─── 12. PROCESS SAFETY NETS ──────────────────────────────────────────────────
 process.on('unhandledRejection', (reason) => {
@@ -263,10 +294,24 @@ function shutdown(code = 0) {
 process.on('SIGTERM', () => shutdown(0));
 process.on('SIGINT', () => shutdown(0));
 
+// ─── 14. SCHEDULED JOBS ───────────────────────────────────────────────────────
+// Release stock held by abandoned checkouts. Runs in-process (single instance);
+// set INTERNAL_CRON=false if an external scheduler calls the endpoint instead.
+function startScheduledJobs() {
+  if (process.env.INTERNAL_CRON === 'false') return;
+  const { cleanupExpiredReservations } = require('./controllers/orderController');
+  const every = Number(process.env.RESERVATION_CLEANUP_INTERVAL_MS) || 5 * 60 * 1000;
+  const run = () => cleanupExpiredReservations().catch((err) => log.error('cron.reservation_cleanup_failed', { err }));
+  setTimeout(run, 30 * 1000).unref();
+  setInterval(run, every).unref();
+  log.info('cron.reservation_cleanup_scheduled', { everyMs: every });
+}
+
 // Only bind a port when run directly (`node index.js`); stay importable for tests.
 if (require.main === module) {
   server.listen(PORT, () => {
     log.info('server.listening', { port: PORT, env: process.env.NODE_ENV, origins: allowedOrigins });
+    startScheduledJobs();
   });
 }
 

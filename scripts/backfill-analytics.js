@@ -1,6 +1,6 @@
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 
 if (!admin.apps.length) {
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {

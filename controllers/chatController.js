@@ -1,8 +1,9 @@
-const admin = require("firebase-admin");
+const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const chatAuth = require("../socket/chatAuth");
 const log = require("../lib/logger");
 const { LIMITS } = require("../config/constants");
+const faqBot = require("../services/faqBot");
 
 const isStaffRole = (role) => role === "admin" || role === "staff";
 
@@ -153,6 +154,12 @@ exports.getChatSession = async (req, res, next) => {
       return res.status(403).json({ success: false, error: "Forbidden" });
     }
 
+    // Once a ticket is closed its conversation is cleared from the customer's
+    // side; staff/admin keep the transcript until an admin deletes the chat.
+    if (!isStaffRole(req.user.role) && chatDoc.data().status === "closed") {
+      return res.status(200).json({ success: true, data: chatDoc.data(), messages: [], truncated: false });
+    }
+
     // Most recent CHAT_HISTORY_LIMIT messages, returned oldest-first.
     const msgsSnapshot = await db
       .collection("chats").doc(chatId).collection("messages")
@@ -174,16 +181,17 @@ exports.getChatSession = async (req, res, next) => {
   }
 };
 
-// GET /api/chat/my-chats  (any authenticated customer) — the caller's own
-// tickets, newest-first, so the widget can resume an open one or list history
-// instead of losing track of it after the widget is closed / the page reloads.
+// GET /api/chat/my-chats  (any authenticated customer) — the caller's OPEN
+// tickets, newest-first, so the widget can resume one after the widget is
+// closed / the page reloads. Closed tickets are not listed to the customer.
 exports.getMyChats = async (req, res, next) => {
   try {
     const snapshot = await db.collection("chats")
       .where("ownerUid", "==", req.user.uid)
       .limit(50)
       .get();
-    const chats = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const chats = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
+      .filter((c) => c.status !== "closed");
     chats.sort((a, b) => {
       const at = a.updatedAt?._seconds || a.updatedAt?.seconds || 0;
       const bt = b.updatedAt?._seconds || b.updatedAt?.seconds || 0;
@@ -221,17 +229,18 @@ exports.closeChat = async (req, res, next) => {
   }
 };
 
-// PUT /api/chat/:chatId/reopen  (owner or staff/admin) — sends the ticket back
-// into the pending queue so staff can pick it up again.
+// PUT /api/chat/:chatId/reopen  (staff/admin) — sends the ticket back into the
+// pending queue. Customers start a new chat instead: a closed ticket's
+// conversation is no longer shown to them.
 exports.reopenChat = async (req, res, next) => {
   try {
     const { chatId } = req.params;
+    if (!isStaffRole(req.user.role)) {
+      return res.status(403).json({ success: false, error: "This ticket is closed. Please start a new chat." });
+    }
     const chatRef = db.collection("chats").doc(chatId);
     const doc = await chatRef.get();
     if (!doc.exists) return res.status(404).json({ success: false, error: "Chat not found" });
-    if (!canAccessChat(req.user, doc.data())) {
-      return res.status(403).json({ success: false, error: "Forbidden" });
-    }
     await chatRef.update({
       status: "pending",
       assignedTo: null,
@@ -320,3 +329,48 @@ exports.getMyActiveChats = async (req, res, next) => {
     next(err);
   }
 };
+
+// DELETE /api/chat/admin/:chatId  (admin) — permanently deletes a chat and all
+// its messages. An open customer widget is told so it resets.
+exports.deleteChat = async (req, res, next) => {
+  try {
+    const { chatId } = req.params;
+    const chatRef = db.collection("chats").doc(chatId);
+    const doc = await chatRef.get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: "Chat not found" });
+
+    // Firestore doesn't cascade: remove the messages subcollection in batches.
+    for (;;) {
+      const batchSnap = await chatRef.collection("messages").limit(400).get();
+      if (batchSnap.empty) break;
+      const batch = db.batch();
+      batchSnap.docs.forEach((d) => batch.delete(d.ref));
+      await batch.commit();
+    }
+    await chatRef.delete();
+    req.app.get('io')?.to(chatId).emit("chat_status", { status: "deleted" });
+    log.info("chat.deleted", { chatId, by: req.user.uid });
+    return res.status(200).json({ success: true, message: "Chat deleted" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/chat/bot  (public; signed-in users also get their order status)
+exports.botReply = async (req, res, next) => {
+  try {
+    const message = typeof req.body?.message === "string" ? req.body.message : "";
+    const reply = await faqBot.answer(message, req.user || null);
+    return res.status(200).json({ success: true, data: reply });
+  } catch (err) {
+    log.error("chat.bot_failed", { requestId: req.id, err });
+    return res.status(200).json({
+      success: true,
+      data: {
+        reply: "Sorry, I couldn't look that up right now. You can chat with a specialist instead.",
+        products: [], links: [], suggestions: [], handoff: true,
+      },
+    });
+  }
+};
+

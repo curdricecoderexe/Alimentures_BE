@@ -10,6 +10,7 @@ const { writeLimiter } = require('../middlewares/rateLimiters');
 
 // A light per-IP/user limiter reusing the generic write bucket is plenty for
 // these cheap reads and stops pincode enumeration scripts.
+router.get('/summary', ctrl.getDeliverySummary);
 router.get('/locations/states', ctrl.getStates);
 router.get('/locations/cities', ctrl.getCities);
 router.get('/pincode/:pincode', writeLimiter, ctrl.getPincodeInfo);

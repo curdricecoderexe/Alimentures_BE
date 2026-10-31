@@ -7,7 +7,7 @@ const { report } = require('../controllers/clientErrorController');
 const clientErrorLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
-  standardHeaders: true,
+  standardHeaders: false,
   legacyHeaders: false,
   message: { success: false, error: 'Too many error reports.' },
 });

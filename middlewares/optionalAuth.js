@@ -6,13 +6,13 @@
  */
 'use strict';
 
-const { verifyIdToken, extractBearer } = require('../utils/firebaseAuth');
+const { authenticate } = require('../utils/firebaseAuth');
 
 module.exports = async function optionalAuth(req, res, next) {
-  const token = extractBearer(req.headers.authorization);
-  if (!token) return next();
   try {
-    req.user = await verifyIdToken(token);
+    const { user, via } = await authenticate({ authorization: req.headers.authorization, cookieHeader: req.headers.cookie, res });
+    req.user = user;
+    req.authVia = via;
   } catch {
     // ignore — treat as anonymous
   }

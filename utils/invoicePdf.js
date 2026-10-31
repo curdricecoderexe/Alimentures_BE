@@ -166,7 +166,7 @@ function buildInvoicePdf(order, orderId) {
     doc.font('Helvetica-Bold').fontSize(11).fillColor(C.berry)
       .text('Thank you for choosing clean.', M, fy + 20, { width: CW, align: 'center' });
     doc.font('Helvetica').fontSize(8).fillColor(C.muted)
-      .text('This is a computer-generated invoice and does not require a signature.\nAlimenture Industries Pvt Ltd  ·  Chennai, Tamil Nadu  ·  alimenture.com', M, fy + 40, { width: CW, align: 'center', lineGap: 2 });
+      .text('This is a computer-generated invoice and does not require a signature.\nAlimenture Industries Pvt Ltd  ·  Chennai, Tamil Nadu  ·  alimenture.in', M, fy + 40, { width: CW, align: 'center', lineGap: 2 });
 
     doc.end();
   });

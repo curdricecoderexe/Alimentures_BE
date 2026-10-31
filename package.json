@@ -12,7 +12,9 @@
     "start": "node index.js",
     "start:dev": "nodemon index.js",
     "sim:webhook": "node scripts/simulate-webhook.js",
-    "analytics:retention": "node scripts/analytics-retention.js"
+    "analytics:retention": "node scripts/analytics-retention.js",
+    "test": "node --test test/",
+    "backfill:email-verified": "node scripts/backfill-email-verified.js"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
@@ -21,7 +23,7 @@
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.2",
-    "firebase-admin": "^13.8.0",
+    "firebase-admin": "^14.5.0",
     "helmet": "^8.3.0",
     "morgan": "^1.11.0",
     "nodemailer": "^10.1.7",

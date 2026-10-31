@@ -1,8 +1,10 @@
-const admin = require("firebase-admin");
+const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const log = require("../lib/logger");
 const { LIMITS } = require("../config/constants");
 const { createAuditLog } = require("../services/auditService");
+const { requestSiteRebuild } = require("../services/siteRebuild");
+const { slugify, buildSlugMap } = require("../lib/slug");
 
 const audit = (req, action, resourceId, previousState, newState) => createAuditLog({
   adminId: req.user?.uid,
@@ -21,6 +23,7 @@ const WRITABLE_FIELDS = [
   'isFeatured', 'isDraft', 'isPrivate', 'tags', 'nutrition', 'ingredients', 'weight',
   'discountPercent', 'badges', 'origin', 'shelfLife',
   'tertiaryImage', 'cleanPromises', 'cleanBadges', 'nutritionFacts',
+  'seoTitle', 'seoDescription', // optional SEO overrides (storefront derives them otherwise)
 ];
 
 // Fields never exposed on a public (non-staff) product read.
@@ -34,20 +37,49 @@ const pickWritable = (body) => {
   return out;
 };
 
-const publicProduct = (obj) => {
+// ─── public serialisation ─────────────────────────────────────────────────────
+// Photos are stored inline (base64) on the product doc. Public responses carry a
+// short, cacheable URL to GET /products/:id/image/:slot instead, which keeps the
+// catalogue JSON tiny (it was ~1.4 MB with the images embedded).
+const IMAGE_SLOTS = { main: 'image', alt: 'secondaryImage', nutrition: 'tertiaryImage' };
+const PUBLIC_STOCK_CAP = 10; // enough for "Only N left" + qty limits; hides real inventory
+
+const tsMillis = (t) => (t?.toMillis ? t.toMillis() : t?._seconds ? t._seconds * 1000 : (t ? new Date(t).getTime() || 0 : 0));
+const toIso = (t) => { const ms = tsMillis(t); return ms ? new Date(ms).toISOString() : null; };
+
+/** Public origin for image URLs: API_PUBLIC_URL in production, else this request's own origin. */
+const publicBase = (req) => (process.env.API_PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+
+/** URL for one stored product photo (unchanged if it is already a URL). */
+function publicImageUrl(base, id, product, slot) {
+  const src = product[IMAGE_SLOTS[slot]];
+  if (typeof src !== 'string' || !src) return src || '';
+  if (!src.startsWith('data:')) return src;
+  return `${base}/api/products/${encodeURIComponent(id)}/image/${slot}?v=${tsMillis(product.updatedAt) || 0}`;
+}
+
+const publicProduct = (obj, base) => {
   const copy = { ...obj };
   for (const f of INTERNAL_FIELDS) delete copy[f];
   delete copy.isDraft;
   delete copy.isPrivate;
-  return copy;
+  if (base) for (const slot of Object.keys(IMAGE_SLOTS)) {
+    if (copy[IMAGE_SLOTS[slot]]) copy[IMAGE_SLOTS[slot]] = publicImageUrl(base, obj.id, obj, slot);
+  }
+  if (copy.stock !== undefined) copy.stock = Math.min(Number(copy.stock) || 0, PUBLIC_STOCK_CAP);
+  if (Array.isArray(copy.variants)) {
+    copy.variants = copy.variants.map((v) => ({ ...v, stock: Math.min(Number(v.stock) || 0, PUBLIC_STOCK_CAP) }));
+  }
+  if (copy.createdAt) copy.createdAt = toIso(copy.createdAt);
+  if (copy.updatedAt) copy.updatedAt = toIso(copy.updatedAt);
+  return withSlug(copy); // previousSlugs stays public: the storefront build 301s them
 };
 
-// Product lists (cards) only need the main image. The extra photos are inline
-// base64 and made public list payloads ~2× larger; the details page reads them
-// from GET /products/:id.
+// Product lists (cards) only need the main image; the details page reads the
+// other photos from GET /products/:id.
 const LIST_ONLY_OMIT = ['secondaryImage', 'tertiaryImage', 'images'];
-const publicListProduct = (obj) => {
-  const copy = publicProduct(obj);
+const publicListProduct = (obj, base) => {
+  const copy = publicProduct(obj, base);
   for (const f of LIST_ONLY_OMIT) delete copy[f];
   return copy;
 };
@@ -55,6 +87,10 @@ const publicListProduct = (obj) => {
 // --- In-Memory Search Cache ---
 let productCache = [];
 let cacheTimestamp = 0;
+let slugMap = new Map(); // product id -> canonical URL slug, rebuilt with the cache
+
+/** Attach the canonical URL slug (see lib/slug.js) to a product object. */
+const withSlug = (p) => ({ ...p, slug: slugMap.get(p.id) || slugify(p.slug || p.title || p.name) || p.id });
 // Short TTL: cached products carry stock ("Sold out"), which orders change
 // without invalidating the cache.
 const CACHE_TTL = 60 * 1000;
@@ -69,11 +105,24 @@ const refreshCache = async () => {
       .get();
     // Cache products; visibility is filtered per-request in searchProducts.
     productCache = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    slugMap = buildSlugMap(productCache);
     cacheTimestamp = Date.now();
   } catch (err) {
     log.error("product.cache_refresh_failed", { err });
   }
 };
+
+/** For other controllers (categories): the cached catalogue, refreshed if stale. */
+exports.getCachedProducts = async () => {
+  if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+  return productCache;
+};
+
+/** Force the next read to hit Firestore (e.g. after a bulk category rename). */
+exports.invalidateProductCache = () => { cacheTimestamp = 0; };
+
+/** For the search controller etc.: attach `slug` to an outgoing product. */
+exports.withSlug = (p) => withSlug(p);
 
 // Levenshtein distance for typo tolerance
 const levenshtein = (a, b) => {
@@ -94,6 +143,7 @@ const levenshtein = (a, b) => {
 
 exports.searchProducts = async (req, res) => {
   try {
+    const base = publicBase(req);
     if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) {
       await refreshCache();
     }
@@ -149,7 +199,8 @@ exports.searchProducts = async (req, res) => {
 
     // 2. Filters
     if (category && category !== 'All') {
-      results = results.filter(p => p.category === category);
+      const wanted = String(category).trim().toLowerCase();
+      results = results.filter(p => (p.category || '').trim().toLowerCase() === wanted);
     }
 
     if (minPrice !== undefined && !isNaN(minPrice) && minPrice >= 0) {
@@ -200,7 +251,7 @@ exports.searchProducts = async (req, res) => {
     const finalData = paginated.map(p => {
       const copy = { ...p };
       delete copy._score;
-      return staff ? copy : publicListProduct(copy);
+      return staff ? withSlug(copy) : publicListProduct(copy, base);
     });
 
     return res.status(200).json({
@@ -274,6 +325,7 @@ exports.createProduct = async (req, res) => {
 
     const doc = await db.collection("products").add(productData);
     cacheTimestamp = 0; // invalidate search cache
+    requestSiteRebuild('product created');
     audit(req, 'CREATE_PRODUCT', doc.id, null, { title: productData.title || productData.name });
 
     return res.status(201).json({ success: true, id: doc.id });
@@ -284,6 +336,7 @@ exports.createProduct = async (req, res) => {
 };
 exports.getProducts = async (req, res) => {
   try {
+    const base = publicBase(req);
     const staff = isStaff(req);
     const limit = Math.min(LIMITS.LIST_LIMIT_MAX, Math.max(1, Number(req.query.limit) || 10));
     const { lastId } = req.query;
@@ -297,7 +350,7 @@ exports.getProducts = async (req, res) => {
       const products = productCache
         .filter(p => p.isDraft !== true && p.isPrivate !== true)
         .slice(0, limit)
-        .map(publicListProduct);
+        .map((p) => publicListProduct(p, base));
       return res.status(200).json({
         success: true,
         count: products.length,
@@ -321,7 +374,9 @@ exports.getProducts = async (req, res) => {
       products = products
         .filter(p => p.isDraft !== true && p.isPrivate !== true)
         .slice(0, limit)
-        .map(publicListProduct);
+        .map((p) => publicListProduct(p, base));
+    } else {
+      products = products.map(withSlug);
     }
 
     return res.status(200).json({
@@ -375,18 +430,32 @@ exports.getLowStockProducts = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to fetch low stock" });
   }
 };
+/**
+ * Resolve a product URL key — a Firestore id, the current slug, or a slug the
+ * product had before a rename — to its document.
+ */
+const findProductDoc = async (key) => {
+  if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+  const k = String(key);
+  let id = null;
+  for (const [pid, slug] of slugMap) if (slug === k) { id = pid; break; }
+  if (!id) id = productCache.find((p) => Array.isArray(p.previousSlugs) && p.previousSlugs.includes(k))?.id || null;
+  const doc = await db.collection("products").doc(id || k).get();
+  return doc.exists ? doc : null;
+};
+
 exports.getProductById = async (req, res) => {
   try {
-    const doc = await db.collection("products").doc(req.params.id).get();
-    if (!doc.exists) return res.status(404).json({ success: false, error: "Product not found" });
+    const doc = await findProductDoc(req.params.id);
+    if (!doc) return res.status(404).json({ success: false, error: "Product not found" });
 
-    const data = { id: doc.id, ...doc.data() };
+    const data = withSlug({ id: doc.id, ...doc.data() });
 
     if (!isStaff(req)) {
       if (data.isDraft === true || data.isPrivate === true) {
         return res.status(404).json({ success: false, error: "Product not found" });
       }
-      return res.status(200).json({ success: true, data: publicProduct(data) });
+      return res.status(200).json({ success: true, data: publicProduct(data, publicBase(req)) });
     }
 
     return res.status(200).json({ success: true, data });
@@ -416,8 +485,17 @@ exports.updateProduct = async (req, res) => {
     if (!existing.exists) return res.status(404).json({ success: false, error: "Product not found" });
 
     const before = existing.data();
+    // A rename changes the URL slug — keep the old one so its links still resolve.
+    if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+    const oldSlug = slugMap.get(id) || slugify(before.slug || before.title || before.name);
+    const newBase = slugify(updates.slug || before.slug || updates.title || before.title || updates.name || before.name);
+    const sameSlug = oldSlug === newBase || oldSlug === `${newBase}-${String(id).slice(0, 6).toLowerCase()}`;
+    if (oldSlug && newBase && !sameSlug) {
+      updates.previousSlugs = admin.firestore.FieldValue.arrayUnion(oldSlug);
+    }
     await docRef.update(updates);
     cacheTimestamp = 0; // Invalidate cache
+    requestSiteRebuild('product updated');
     audit(req, 'UPDATE_PRODUCT', id,
       { price: before.price, stock: before.stock, isDraft: before.isDraft, isPrivate: before.isPrivate },
       { price: updates.price, stock: updates.stock, isDraft: updates.isDraft, isPrivate: updates.isPrivate });
@@ -436,6 +514,7 @@ exports.deleteProduct = async (req, res) => {
 
     await docRef.delete();
     cacheTimestamp = 0; // Invalidate cache
+    requestSiteRebuild('product deleted');
     audit(req, 'DELETE_PRODUCT', req.params.id, { title: doc.data().title || doc.data().name }, null);
     return res.status(200).json({ success: true, message: "Product deleted" });
   } catch (err) {
@@ -502,3 +581,60 @@ exports.updateProductStock = async (req, res) => {
     return res.status(500).json({ success: false, error: "Failed to update stock" });
   }
 };
+
+// GET /products/:id/image/:slot  (public) — one product photo as a real image
+// file, decoded from the stored base64. URLs carry ?v=<updatedAt>, so a given
+// URL never changes content and can be cached for a year.
+const imageCache = new Map(); // `${id}:${slot}:${v}` -> { type, buf }
+const IMAGE_CACHE_MAX = 200;
+
+exports.getProductImage = async (req, res) => {
+  try {
+    const { id, slot } = req.params;
+    const field = IMAGE_SLOTS[slot];
+    if (!field || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return res.status(404).end();
+
+    if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+    let product = productCache.find((p) => p.id === id);
+    if (!product) {
+      const doc = await db.collection("products").doc(id).get();
+      product = doc.exists ? { id: doc.id, ...doc.data() } : null;
+    }
+    if (!product || product.isDraft === true || product.isPrivate === true) return res.status(404).end();
+
+    const src = product[field];
+    if (typeof src !== 'string' || !src) return res.status(404).end();
+    if (!src.startsWith('data:')) return res.redirect(302, src);
+
+    const version = String(tsMillis(product.updatedAt) || 0);
+    const key = `${id}:${slot}:${version}`;
+    let hit = imageCache.get(key);
+    if (!hit) {
+      const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(src);
+      if (!m) return res.status(404).end();
+      hit = { type: m[1].toLowerCase(), buf: Buffer.from(m[2], 'base64') };
+      if (imageCache.size >= IMAGE_CACHE_MAX) imageCache.delete(imageCache.keys().next().value);
+      imageCache.set(key, hit);
+    }
+
+    const etag = `"${key}"`;
+    const immutable = req.query.v === version;
+    res.set({
+      'Content-Type': hit.type,
+      'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'public, max-age=3600',
+      ETag: etag,
+      'Cross-Origin-Resource-Policy': 'cross-origin',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    if (req.headers['if-none-match'] === etag) return res.status(304).end();
+    return res.send(hit.buf);
+  } catch (err) {
+    log.error("product.image_failed", { requestId: req.id, err });
+    return res.status(500).end();
+  }
+};
+
+exports.publicImageUrl = publicImageUrl;
+exports.publicBase = publicBase;
+exports.PUBLIC_STOCK_CAP = PUBLIC_STOCK_CAP;
+

@@ -13,8 +13,9 @@
 
 'use strict';
 
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 const db = require('../config/firebase');
+const session = require('../lib/session');
 
 // ── Short-TTL cache of the Firestore users/{uid} doc ──────────────────────────
 // The ID-token signature check is cheap local crypto; the per-request Firestore
@@ -83,6 +84,12 @@ async function verifyIdToken(rawToken) {
     throw authError(403, 'Your account has been deactivated. Please contact support.', 'auth/account-disabled');
   }
 
+  // Email ownership must be proven (registration / login codes are emailed, and
+  // a successful code marks the account verified — see userController).
+  if (decoded.email_verified !== true && data.emailVerified !== true) {
+    throw authError(403, 'Please verify your email address to continue. Sign in again to receive a code.', 'auth/email-unverified');
+  }
+
   // Tokens issued before an explicit logout / forced sign-out are rejected.
   const validAfter = data.tokensValidAfter?.toMillis
     ? data.tokensValidAfter.toMillis()
@@ -107,4 +114,44 @@ function extractBearer(headerValue) {
   return parts.length === 2 ? parts[1].trim() : null;
 }
 
-module.exports = { verifyIdToken, extractBearer, authError, invalidateUser };
+const looksLikeJwt = (t) => typeof t === 'string' && t.split('.').length === 3;
+
+/**
+ * Authenticate a request from a Bearer header (API clients, legacy sessions) or
+ * the httpOnly session cookies set at login. An expired cookie session is
+ * refreshed transparently; pass `res` so the new cookies are sent back.
+ *
+ * @returns {Promise<{ user: object, via: 'bearer'|'cookie' }>}
+ */
+async function authenticate({ authorization, cookieHeader, res } = {}) {
+  const bearer = extractBearer(authorization);
+  if (looksLikeJwt(bearer)) return { user: await verifyIdToken(bearer), via: 'bearer' };
+
+  const cookies = session.parseCookies(cookieHeader);
+  const idToken = cookies[session.ID_COOKIE];
+  const refreshToken = cookies[session.REFRESH_COOKIE];
+
+  if (idToken) {
+    try {
+      return { user: await verifyIdToken(idToken), via: 'cookie' };
+    } catch (err) {
+      // Only an expired/invalid token is worth refreshing; deactivation etc. stand.
+      if (!refreshToken || err.status !== 401) throw err;
+    }
+  }
+  if (refreshToken) {
+    let fresh;
+    try {
+      fresh = await session.refreshIdToken(refreshToken);
+    } catch {
+      session.clearSessionCookies(res);
+      throw authError(401, 'Session expired', 'auth/refresh-failed');
+    }
+    const user = await verifyIdToken(fresh.idToken);
+    session.setSessionCookies(res, fresh);
+    return { user, via: 'cookie' };
+  }
+  throw authError(401, 'Authentication required', 'auth/no-token');
+}
+
+module.exports = { verifyIdToken, extractBearer, authenticate, authError, invalidateUser };

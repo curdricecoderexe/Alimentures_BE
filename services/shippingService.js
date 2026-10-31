@@ -14,7 +14,7 @@
  */
 'use strict';
 
-const admin = require('firebase-admin');
+const admin = require('../lib/firebaseAdmin');
 const db = require('../config/firebase');
 const log = require('../lib/logger');
 const shiprocket = require('./shiprocketService');

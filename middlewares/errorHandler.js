@@ -4,8 +4,8 @@
  * Guarantees:
  *   - Clients NEVER receive a stack trace, a raw Firestore/driver message, or
  *     internal paths. 5xx responses are always the generic message.
- *   - Every response carries the requestId so a client report can be traced to
- *     the full server-side log line.
+ *   - Every response carries the request id in the X-Request-ID header so a
+ *     client report can be traced to the full server-side log line.
  *   - 4xx errors that explicitly opt in (`err.expose === true`, e.g. the typed
  *     errors from utils/firebaseAuth) may surface `err.publicMessage`.
  */
@@ -58,10 +58,10 @@ function errorHandler(err, req, res, next) {
 
   if (res.headersSent) return next(err);
 
+  // The request id stays in the X-Request-ID header (for support), not the body.
   res.status(status).json({
     success: false,
     error: safeMessage,
-    requestId: req.id,
   });
 }
 

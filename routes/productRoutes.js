@@ -9,7 +9,8 @@ const {
   updateProduct,
   deleteProduct,
   updateProductStock,
-  searchProducts
+  searchProducts,
+  getProductImage,
 } = require("../controllers/productController");
 
 const verifyToken = require("../middlewares/verifyToken");
@@ -23,6 +24,7 @@ router.post("/", verifyToken, isStaff, productImages, createProduct);
 router.get("/low-stock", verifyToken, isStaff, getLowStockProducts);
 router.get("/search", optionalAuth, searchProducts);
 router.get("/", optionalAuth, getProducts);
+router.get("/:id/image/:slot", getProductImage); // public, long-cached product photos
 router.get("/:id", optionalAuth, getProductById);
 router.put("/:id", verifyToken, isStaff, productImages, updateProduct);
 router.patch("/:id/stock", verifyToken, isStaff, updateProductStock);
