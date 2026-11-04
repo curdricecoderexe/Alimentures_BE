@@ -5,6 +5,7 @@ const { LIMITS } = require("../config/constants");
 const { createAuditLog } = require("../services/auditService");
 const { requestSiteRebuild } = require("../services/siteRebuild");
 const { slugify, buildSlugMap } = require("../lib/slug");
+const { validateVariantShipping, normaliseVariantShipping } = require("../services/packageService");
 
 const audit = (req, action, resourceId, previousState, newState) => createAuditLog({
   adminId: req.user?.uid,
@@ -24,7 +25,12 @@ const WRITABLE_FIELDS = [
   'discountPercent', 'badges', 'origin', 'shelfLife',
   'tertiaryImage', 'cleanPromises', 'cleanBadges', 'nutritionFacts',
   'seoTitle', 'seoDescription', // optional SEO overrides (storefront derives them otherwise)
+  'hsn', 'gstRate', // tax data sent to Shiprocket invoices / e-way bills
 ];
+
+const SKU_RE = /^[A-Za-z0-9._/-]{1,50}$/;
+const HSN_RE = /^\d{4,8}$/;
+const GST_RATES = [0, 5, 12, 18, 28];
 
 // Fields never exposed on a public (non-staff) product read.
 const INTERNAL_FIELDS = ['cost', 'costPrice', 'margin', 'supplier', 'supplierNotes', 'internalNotes', 'notes'];
@@ -279,14 +285,28 @@ const validateProduct = (data, isUpdate = false) => {
   if (data.stock !== undefined && Number(data.stock) < 0) return "Stock cannot be negative";
   if (data.price !== undefined && Number(data.price) < 0) return "Price cannot be negative";
 
+  if (data.hsn != null && data.hsn !== '' && !HSN_RE.test(String(data.hsn).trim())) return "HSN code must be 4–8 digits";
+  if (data.gstRate != null && data.gstRate !== '' && !GST_RATES.includes(Number(data.gstRate))) {
+    return `GST rate must be one of ${GST_RATES.join(', ')}%`;
+  }
+
   // Check Variants
   if (data.variants && Array.isArray(data.variants)) {
+    const skus = new Set();
     for (let variant of data.variants) {
+      if (variant.sku != null && variant.sku !== '') {
+        const sku = String(variant.sku).trim();
+        if (!SKU_RE.test(sku)) return `SKU for ${variant.weight} may only use letters, digits and . _ / - (max 50)`;
+        if (skus.has(sku.toUpperCase())) return `SKU "${sku}" is used by two variants`;
+        skus.add(sku.toUpperCase());
+      }
       if (variant.price !== undefined && Number(variant.price) < 0) return `Variant price for ${variant.weight} cannot be negative`;
       if (variant.stock !== undefined && Number(variant.stock) < 0) return `Variant stock for ${variant.weight} cannot be negative`;
       if (variant.mrp != null && variant.mrp !== '' && !(Number(variant.mrp) > Number(variant.price || 0))) {
         return `MRP for ${variant.weight} must be higher than its selling price`;
       }
+      const shipErr = validateVariantShipping(variant);
+      if (shipErr) return shipErr;
     }
   }
 
@@ -301,6 +321,17 @@ const sanitizeData = (data) => {
   if (sanitized.title) sanitized.title = sanitized.title.trim();
   if (sanitized.category) sanitized.category = sanitized.category.trim();
   if (sanitized.description) sanitized.description = sanitized.description.trim();
+  // Packed weight / L×B×H per variant drive the Shiprocket parcel (packageService).
+  if (Array.isArray(sanitized.variants)) {
+    sanitized.variants = sanitized.variants.map((v) => {
+      const out = normaliseVariantShipping(v);
+      const sku = typeof v.sku === 'string' ? v.sku.trim() : '';
+      if (sku) out.sku = sku; else delete out.sku;
+      return out;
+    });
+  }
+  if (sanitized.hsn !== undefined) sanitized.hsn = sanitized.hsn === '' || sanitized.hsn == null ? '' : String(sanitized.hsn).trim();
+  if (sanitized.gstRate !== undefined) sanitized.gstRate = sanitized.gstRate === '' || sanitized.gstRate == null ? null : Number(sanitized.gstRate);
   return sanitized;
 };
 exports.createProduct = async (req, res) => {

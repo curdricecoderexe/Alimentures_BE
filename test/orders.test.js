@@ -20,7 +20,7 @@ function seedCatalogue() {
   razorpayBehaviour.fetchPayments = async () => ({ items: [] });
   db.seed('products/cookie', {
     title: 'Ragi Cookies', category: 'Cookies', price: 90, stock: 5,
-    variants: [{ weight: '120g', price: 90, stock: 5 }],
+    variants: [{ weight: '120g', price: 90, stock: 5, shipWeightKg: 0.14, dims: { l: 14, b: 10, h: 4 } }],
   });
   db.seed('products/ghee', {
     title: 'A2 Ghee', category: 'Others', price: 450, stock: 2,
@@ -58,6 +58,18 @@ test('createOrder prices from the database, reserves stock and opens a Razorpay 
   const reservation = db.read(`stockReservations/${order.reservationId}`);
   assert.equal(reservation.status, 'ACTIVE');
   assert.equal(reservation.orderId, res.body.orderId);
+});
+
+test('createOrder snapshots packed weight + size onto order items for the parcel', async () => {
+  const res = await placeOrder({ items: [
+    { productId: 'cookie', selectedWeight: '120g', quantity: 1 },
+    { productId: 'ghee', selectedWeight: '500ml', quantity: 1 },
+  ] });
+  assert.equal(res.statusCode, 201, JSON.stringify(res.body));
+  const [cookie, ghee] = db.read(`orders/${res.body.orderId}`).items;
+  assert.equal(cookie.shipWeightKg, 0.14);
+  assert.deepEqual(cookie.dims, { l: 14, b: 10, h: 4 });
+  assert.ok(!('shipWeightKg' in ghee) && !('dims' in ghee), 'no shipping data → no fields');
 });
 
 test('createOrder applies free delivery above the threshold', async () => {

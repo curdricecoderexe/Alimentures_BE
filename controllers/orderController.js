@@ -4,7 +4,8 @@ const { sendMail } = require('../utils/mailer');
 const { buildOrderEmail } = require('../utils/emailTemplates');
 const { buildInvoicePdf } = require('../utils/invoicePdf');
 const { computeDeliveryFee, isValidPincode, DeliveryError } = require('../services/deliveryService');
-const { autoCreateShipment } = require('../services/shippingService');
+const { autoCreateShipment, cancelShipmentForOrder } = require('../services/shippingService');
+const { variantShipping, quoteWeightKg } = require('../services/packageService');
 const { DELIVERY_METHODS } = require('../config/deliveryConstants');
 const { createNotification } = require('./notificationController');
 const Razorpay = require('razorpay');
@@ -460,6 +461,7 @@ exports.getOrderById = async (req, res) => {
 };
 
 const RAZORPAY_RESERVATION_MINUTES = 10;
+const GST_RATE_OK = (r) => r !== null && r !== '' && r !== undefined && [0, 5, 12, 18, 28].includes(Number(r));
 
 // Only these customerInfo sub-fields are accepted from the client; email is
 // always taken from the authenticated session.
@@ -544,6 +546,12 @@ exports.createOrder = async (req, res) => {
         price: unitPrice,
         image: product.image || '',
         category: product.category || 'General',
+        // Packed weight / size snapshot so the parcel matches what was sold.
+        ...variantShipping(variants[vi]),
+        // Catalogue SKU + tax data for the Shiprocket order / invoice.
+        ...(variants[vi]?.sku ? { sku: String(variants[vi].sku) } : {}),
+        ...(product.hsn ? { hsn: String(product.hsn) } : {}),
+        ...(GST_RATE_OK(product.gstRate) ? { gstRate: Number(product.gstRate) } : {}),
       });
     }
 
@@ -560,6 +568,8 @@ exports.createOrder = async (req, res) => {
         pincode: resolvePincode,
         method: deliveryMethod,
         subtotal: calculatedSubtotal,
+        // Real parcel weight → correct courier check, ETA and freight quote.
+        weightKg: await quoteWeightKg(sanitizedItems),
       });
     } catch (delErr) {
       if (delErr instanceof DeliveryError) {
@@ -645,6 +655,10 @@ exports.createOrder = async (req, res) => {
         deliveryMethod: delivery.method,
         deliveryPincode: resolvePincode || customerInfo.pincode || null,
         deliveryEstimate: delivery.eta || null,
+        // Who delivers ('local' = dedicated partner, never pushed to Shiprocket)
+        // and Shiprocket's freight quote at checkout (for fee-vs-cost margin).
+        deliveryPartner: delivery.partner || 'shiprocket',
+        estimatedShippingCost: delivery.estimatedShippingCost ?? null,
         totalAmount,
         discountAmount,
         couponId,
@@ -1195,7 +1209,15 @@ exports.refundOrder = async (req, res) => {
     if (existingData.userId) {
       createNotification(existingData.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
     }
-    return res.status(200).json({ success: true, message: "Refund processed", refundId: refund?.id || null });
+
+    // Stop the parcel (and release the wallet freight hold) if the courier hasn't picked it up.
+    const shipmentCancel = existingData.shipment?.srOrderId
+      ? await cancelShipmentForOrder(id, { reason: 'refund' })
+      : 'not_needed';
+    if (shipmentCancel === 'failed') {
+      createNotification('admin', 'Cancel shipment manually', `Order ${short} was refunded but its Shiprocket shipment could not be cancelled. Cancel it in the Shiprocket panel.`);
+    }
+    return res.status(200).json({ success: true, message: "Refund processed", refundId: refund?.id || null, shipmentCancel });
   } catch (err) {
     if (err.message === "NOT_FOUND") return res.status(404).json({ success: false, error: "Order not found" });
     if (err.message === "INVALID_STATE") return res.status(409).json({ success: false, error: "Order was modified — refund aborted, gateway refund may need manual reconciliation" });

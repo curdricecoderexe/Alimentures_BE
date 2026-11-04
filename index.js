@@ -305,6 +305,14 @@ function startScheduledJobs() {
   setTimeout(run, 30 * 1000).unref();
   setInterval(run, every).unref();
   log.info('cron.reservation_cleanup_scheduled', { everyMs: every });
+
+  // Re-push paid orders whose automatic Shiprocket push failed (3 attempts, then alert admin).
+  const { runShipmentRetry } = require('./controllers/shippingController');
+  const retryEvery = Number(process.env.SHIPMENT_RETRY_INTERVAL_MS) || 15 * 60 * 1000;
+  const retry = () => runShipmentRetry().catch((err) => log.error('cron.shipment_retry_failed', { err }));
+  setTimeout(retry, 60 * 1000).unref();
+  setInterval(retry, retryEvery).unref();
+  log.info('cron.shipment_retry_scheduled', { everyMs: retryEvery });
 }
 
 // Only bind a port when run directly (`node index.js`); stay importable for tests.
