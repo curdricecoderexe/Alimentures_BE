@@ -14,3 +14,6 @@ logs/
 
 .DS_Store
 coverage/
+
+# local data backups written by maintenance scripts
+scripts/backups/

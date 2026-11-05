@@ -1,10 +1,12 @@
 const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const { sendMail } = require('../utils/mailer');
-const { buildOrderEmail } = require('../utils/emailTemplates');
+const { buildOrderEmail, buildAdminOrderAlert } = require('../utils/emailTemplates');
+const whatsapp = require('../services/whatsappService');
 const { buildInvoicePdf } = require('../utils/invoicePdf');
 const { computeDeliveryFee, isValidPincode, DeliveryError } = require('../services/deliveryService');
-const { autoCreateShipment } = require('../services/shippingService');
+const { autoCreateShipment, cancelShipmentForOrder, publicShipment } = require('../services/shippingService');
+const { variantShipping, quotePackage, packageSnapshot, OVERSIZE_MESSAGE } = require('../services/packageService');
 const { DELIVERY_METHODS } = require('../config/deliveryConstants');
 const { createNotification } = require('./notificationController');
 const Razorpay = require('razorpay');
@@ -34,6 +36,10 @@ async function sendOrderEmail(orderId, kind, extra = {}) {
     const snap = await db.collection('orders').doc(orderId).get();
     if (!snap.exists) return;
     const order = snap.data();
+    // WhatsApp the customer on the same status changes they're emailed about.
+    if (kind === 'status' || kind === 'cancelled' || kind === 'refunded') {
+      whatsapp.notifyStatus(orderId, order, kind === 'status' ? extra.status : kind).catch(() => {});
+    }
     const to = order.customerInfo && order.customerInfo.email;
     if (!to) return;
 
@@ -59,6 +65,32 @@ async function sendOrderEmail(orderId, kind, extra = {}) {
   }
 }
 exports.sendOrderEmail = sendOrderEmail; // reused by the Shiprocket tracking flow
+
+/** Comma-separated team inboxes for new-order alerts (ORDER_ALERT_EMAILS). */
+const orderAlertEmails = () => String(process.env.ORDER_ALERT_EMAILS || '')
+  .split(',').map((e) => e.trim()).filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+
+/**
+ * A payment was just confirmed: email the full order to the shop team and
+ * send the WhatsApp alerts. Fire-and-forget — never throws.
+ */
+async function alertTeamOfPaidOrder(orderId) {
+  try {
+    const snap = await db.collection('orders').doc(orderId).get();
+    if (!snap.exists) return;
+    const order = snap.data();
+    const inStock = order.status !== 'payment_successful_no_stock';
+    const to = orderAlertEmails();
+    const jobs = [whatsapp.notifyPaidOrder(orderId, order, { inStock })];
+    if (to.length) {
+      const { subject, text, html } = buildAdminOrderAlert({ order, orderId });
+      jobs.push(sendMail(to.join(','), inStock ? subject : `⚠ OUT OF STOCK — ${subject}`, text, html));
+    }
+    await Promise.allSettled(jobs);
+  } catch (err) {
+    log.warn('order.team_alert_failed', { orderId, err });
+  }
+}
 
 function computeDiscount(coupon, subtotal) {
   if (coupon.discountType === 'percentage') {
@@ -379,6 +411,19 @@ exports.getOrders = async (req, res) => {
   }
 };
 
+const isStaffRole = (user) => ['admin', 'staff'].includes(String(user?.role || '').toLowerCase());
+
+/**
+ * Customer view of an order: drops our courier cost / margin and internal
+ * packing + shipment-ops fields. Staff and admin get the full document.
+ */
+function orderForViewer(order, user) {
+  if (isStaffRole(user)) return order;
+  const { estimatedShippingCost, quotedCourier, plannedPackage, reservationId, ...rest } = order;
+  if (rest.shipment) rest.shipment = publicShipment(rest.shipment); // same allow-list as /shipping/track
+  return rest;
+}
+
 async function ordersForEmail(email, req, res) {
   const limit = Math.min(LIST_LIMIT_MAX, Math.max(1, Number(req.query.limit) || 50));
   const filtered = db.collection("orders").where("customerInfo.email", "==", email);
@@ -395,9 +440,9 @@ async function ordersForEmail(email, req, res) {
   const orders = await Promise.all(docs.map(async (doc) => {
     const data = doc.data();
     if (await reconcileRazorpayOrder(doc.id, data)) {
-      return { id: doc.id, ...(await db.collection("orders").doc(doc.id).get()).data() };
+      return orderForViewer({ id: doc.id, ...(await db.collection("orders").doc(doc.id).get()).data() }, req.user);
     }
-    return { id: doc.id, ...data };
+    return orderForViewer({ id: doc.id, ...data }, req.user);
   }));
   return res.status(200).json({
     success: true,
@@ -450,16 +495,17 @@ exports.getOrderById = async (req, res) => {
 
     if (await reconcileRazorpayOrder(doc.id, orderData)) {
       const fresh = await db.collection("orders").doc(doc.id).get();
-      return res.status(200).json({ success: true, data: { id: doc.id, ...fresh.data() } });
+      return res.status(200).json({ success: true, data: orderForViewer({ id: doc.id, ...fresh.data() }, req.user) });
     }
-    return res.status(200).json({ success: true, data: { id: doc.id, ...orderData } });
+    return res.status(200).json({ success: true, data: orderForViewer({ id: doc.id, ...orderData }, req.user) });
   } catch (err) {
-    console.error("GET ORDER BY ID ERROR:", err);
+    log.error("order.get_by_id_failed", { requestId: req.id, err });
     return res.status(500).json({ success: false, error: "Internal server error" });
   }
 };
 
 const RAZORPAY_RESERVATION_MINUTES = 10;
+const GST_RATE_OK = (r) => r !== null && r !== '' && r !== undefined && [0, 5, 12, 18, 28].includes(Number(r));
 
 // Only these customerInfo sub-fields are accepted from the client; email is
 // always taken from the authenticated session.
@@ -544,6 +590,12 @@ exports.createOrder = async (req, res) => {
         price: unitPrice,
         image: product.image || '',
         category: product.category || 'General',
+        // Packed weight / size snapshot so the parcel matches what was sold.
+        ...variantShipping(variants[vi]),
+        // Catalogue SKU + tax data for the Shiprocket order / invoice.
+        ...(variants[vi]?.sku ? { sku: String(variants[vi].sku) } : {}),
+        ...(product.hsn ? { hsn: String(product.hsn) } : {}),
+        ...(GST_RATE_OK(product.gstRate) ? { gstRate: Number(product.gstRate) } : {}),
       });
     }
 
@@ -555,17 +607,25 @@ exports.createOrder = async (req, res) => {
     const deliveryMethod = DELIVERY_METHODS.includes(req.body.deliveryMethod) ? req.body.deliveryMethod : 'standard';
     const resolvePincode = isValidPincode(customerInfo.pincode) ? customerInfo.pincode : '';
     let delivery;
+    // The box this cart auto-packs into — quoted now, reused at dispatch.
+    const plannedPkg = await quotePackage(sanitizedItems);
     try {
       delivery = await computeDeliveryFee({
         pincode: resolvePincode,
         method: deliveryMethod,
         subtotal: calculatedSubtotal,
+        // Real parcel weight → correct courier check, ETA and freight quote.
+        weightKg: plannedPkg?.chargeableKg ?? null,
       });
     } catch (delErr) {
       if (delErr instanceof DeliveryError) {
         return res.status(400).json({ success: false, error: delErr.publicMessage, code: delErr.code });
       }
       throw delErr;
+    }
+    // Shiprocket ships one parcel: a cart bigger than the largest box can't be quoted or shipped.
+    if (plannedPkg?.oversize && delivery.partner !== 'local') {
+      return res.status(400).json({ success: false, error: OVERSIZE_MESSAGE, code: 'PARCEL_TOO_LARGE' });
     }
     const shipping = delivery.fee;
 
@@ -645,6 +705,14 @@ exports.createOrder = async (req, res) => {
         deliveryMethod: delivery.method,
         deliveryPincode: resolvePincode || customerInfo.pincode || null,
         deliveryEstimate: delivery.eta || null,
+        // Who delivers ('local' = dedicated partner, never pushed to Shiprocket)
+        // and Shiprocket's freight quote at checkout (for fee-vs-cost margin).
+        deliveryPartner: delivery.partner || 'shiprocket',
+        estimatedShippingCost: delivery.estimatedShippingCost ?? null,
+        // Cheapest (or express, for fastest) courier quoted at checkout + the box it
+        // was quoted for. Dispatch reuses both so the cost matches what was charged.
+        quotedCourier: delivery.quotedCourier || null,
+        plannedPackage: packageSnapshot(plannedPkg),
         totalAmount,
         discountAmount,
         couponId,
@@ -770,6 +838,13 @@ exports.verifyRazorpay = async (req, res) => {
     if (orderData.userId !== req.user.uid && !['admin', 'staff'].includes(req.user.role)) {
       return res.status(403).json({ success: false, error: "Forbidden" });
     }
+    // The signature only proves Razorpay issued THIS razorpay_order_id. It must be
+    // the one created for this order — otherwise a payment for a cheap order could
+    // be replayed to confirm an expensive one.
+    if (!orderData.razorpayOrderId || orderData.razorpayOrderId !== String(razorpay_order_id)) {
+      log.warn('order.verify_order_mismatch', { requestId: req.id, orderId });
+      return res.status(400).json({ success: false, error: "Payment does not belong to this order" });
+    }
     if (orderData.status !== "payment_pending") {
       return res.status(200).json({ success: true, message: "Order already confirmed" });
     }
@@ -868,6 +943,7 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
 
   const short = `#${orderId.slice(-6).toUpperCase()}`;
   sendOrderEmail(orderId, 'paid');
+  alertTeamOfPaidOrder(orderId);
   ['admin', 'staff'].forEach((target) => {
     createNotification(target, 'New Paid Order', `Paid order ${short} received via Razorpay${source === 'webhook' ? ' (webhook)' : ''}`);
   });
@@ -947,6 +1023,7 @@ async function reconcileDashboardRefund(entity) {
 }
 
 exports.razorpayWebhook = async (req, res) => {
+  let eventRef = null;
   try {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
     const signature = req.headers['x-razorpay-signature'];
@@ -972,7 +1049,7 @@ exports.razorpayWebhook = async (req, res) => {
 
     // Event de-duplication
     const eventId = req.headers['x-razorpay-event-id'] || payload.id || `${payload.event}:${Date.now()}`;
-    const eventRef = db.collection('webhookEvents').doc(String(eventId));
+    eventRef = db.collection('webhookEvents').doc(String(eventId));
     const seen = await eventRef.get();
     if (seen.exists) return res.status(200).send('Duplicate event ignored');
     await eventRef.set({
@@ -1001,6 +1078,8 @@ exports.razorpayWebhook = async (req, res) => {
     return res.status(200).send('Webhook processed');
   } catch (error) {
     log.error("webhook.error", { requestId: req.id, err: error });
+    // Un-mark the event so Razorpay's retry is processed instead of skipped as a duplicate.
+    if (eventRef) await eventRef.delete().catch(() => {});
     return res.status(500).send('Internal server error');
   }
 };
@@ -1195,7 +1274,15 @@ exports.refundOrder = async (req, res) => {
     if (existingData.userId) {
       createNotification(existingData.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
     }
-    return res.status(200).json({ success: true, message: "Refund processed", refundId: refund?.id || null });
+
+    // Stop the parcel (and release the wallet freight hold) if the courier hasn't picked it up.
+    const shipmentCancel = existingData.shipment?.srOrderId
+      ? await cancelShipmentForOrder(id, { reason: 'refund' })
+      : 'not_needed';
+    if (shipmentCancel === 'failed') {
+      createNotification('admin', 'Cancel shipment manually', `Order ${short} was refunded but its Shiprocket shipment could not be cancelled. Cancel it in the Shiprocket panel.`);
+    }
+    return res.status(200).json({ success: true, message: "Refund processed", refundId: refund?.id || null, shipmentCancel });
   } catch (err) {
     if (err.message === "NOT_FOUND") return res.status(404).json({ success: false, error: "Order not found" });
     if (err.message === "INVALID_STATE") return res.status(409).json({ success: false, error: "Order was modified — refund aborted, gateway refund may need manual reconciliation" });

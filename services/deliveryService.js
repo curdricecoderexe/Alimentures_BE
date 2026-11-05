@@ -2,6 +2,12 @@
  * deliveryService.js — the single source of truth for delivery availability
  * and delivery-fee resolution.
  *
+ * Delivery partner (per PIN rule, default Shiprocket):
+ *   - 'local'      → your dedicated partner; Shiprocket is never consulted.
+ *   - 'shiprocket' → the live courier check ALWAYS runs (even when an admin rule
+ *                    exists), so a PIN no courier serves is blocked before payment.
+ *                    The check uses the cart's real parcel weight.
+ *
  * Priority (spec §8):
  *   1. PIN-code-specific fastest configuration
  *   2. PIN-code-specific standard configuration
@@ -20,7 +26,7 @@ const log = require('../lib/logger');
 const shiprocket = require('./shiprocketService');
 const {
   DEFAULT_SETTINGS, SETTINGS_COLLECTION, SETTINGS_DOC, PINCODE_COLLECTION,
-  PINCODE_RE, FEE_MIN, FEE_MAX,
+  PINCODE_RE, FEE_MIN, FEE_MAX, DELIVERY_PARTNERS, COURIER_FEE_MODES,
 } = require('../config/deliveryConstants');
 
 /* ── global settings (short-lived in-process cache) ─────────────────────── */
@@ -51,6 +57,54 @@ function toBool(v, fallback) {
   return !!v;
 }
 
+/**
+ * Fee bands keyed on the courier's freight quote: [{ maxRate, fee }], sorted
+ * ascending with maxRate 0 ("and above") last. At most 10 bands.
+ */
+function normaliseFeeBands(raw, fallback) {
+  if (!Array.isArray(raw)) return fallback.map((b) => ({ ...b }));
+  const bands = raw.slice(0, 10)
+    .map((b) => ({ maxRate: clampFee(b?.maxRate, 0), fee: clampFee(b?.fee, NaN) }))
+    .filter((b) => Number.isFinite(b.fee));
+  bands.sort((a, b) => (a.maxRate || Infinity) - (b.maxRate || Infinity));
+  return bands.length ? bands : fallback.map((b) => ({ ...b }));
+}
+
+/** Customer fee for a courier freight quote, or null when no band matches. */
+function feeForCourierRate(rate, bands) {
+  if (!(rate > 0) || !Array.isArray(bands)) return null;
+  const band = bands.find((b) => !b.maxRate || rate <= b.maxRate);
+  return band ? band.fee : null;
+}
+
+/**
+ * Customer fee from a courier freight quote under the admin's courier-fee mode,
+ * or null (→ caller falls back) when not courier-linked or there's no quote.
+ */
+function courierLinkedFeeFor(rate, settings) {
+  if (!settings.courierLinkedFee || !(rate > 0)) return null;
+  if (settings.courierFeeMode === 'actual') {
+    return clampFee(Math.ceil(rate * (1 + settings.courierFeeMarkupPct / 100)), null);
+  }
+  return feeForCourierRate(rate, settings.courierFeeBands);
+}
+
+/** Cheapest courier in a quote list (ties → faster). */
+function pickCheapestCourier(couriers = []) {
+  return couriers
+    .filter((c) => c.rate > 0)
+    .sort((a, b) => a.rate - b.rate || (a.estimatedDays || 99) - (b.estimatedDays || 99))[0] || null;
+}
+
+/** Fastest air/express courier: non-surface, fewest days, then cheapest. */
+function pickExpressCourier(couriers = []) {
+  return couriers
+    .filter((c) => !c.isSurface && c.estimatedDays)
+    .sort((a, b) => a.estimatedDays - b.estimatedDays || a.rate - b.rate)[0] || null;
+}
+
+const partnerOf = (rule) => (rule && DELIVERY_PARTNERS.includes(rule.deliveryPartner) ? rule.deliveryPartner : 'shiprocket');
+
 /** Merge a saved settings doc over the defaults; coerce/clamp every value. */
 function normaliseSettings(raw = {}) {
   const d = DEFAULT_SETTINGS;
@@ -66,6 +120,11 @@ function normaliseSettings(raw = {}) {
     fastestMinOrderValue: clampFee(raw.fastestMinOrderValue, d.fastestMinOrderValue),
     fastestMaxOrderValue: clampFee(raw.fastestMaxOrderValue, d.fastestMaxOrderValue),
     serviceByDefault: toBool(raw.serviceByDefault, d.serviceByDefault),
+    courierLinkedFee: toBool(raw.courierLinkedFee, d.courierLinkedFee),
+    courierFeeMode: COURIER_FEE_MODES.includes(raw.courierFeeMode) ? raw.courierFeeMode : d.courierFeeMode,
+    courierFeeMarkupPct: Math.min(100, Math.max(0, Number.isFinite(Number(raw.courierFeeMarkupPct)) && raw.courierFeeMarkupPct !== ''
+      ? Number(raw.courierFeeMarkupPct) : d.courierFeeMarkupPct)),
+    courierFeeBands: normaliseFeeBands(raw.courierFeeBands, d.courierFeeBands),
     updatedAt: raw.updatedAt || null,
     updatedBy: raw.updatedBy || null,
   };
@@ -114,27 +173,48 @@ async function getPincodeRule(pincode) {
 const _serviceCache = new Map();
 const SERVICE_TTL_MS = 6 * 60 * 60 * 1000;
 const SERVICE_CACHE_MAX = 5000;
+const DEFAULT_QUOTE_KG = 0.5;
+
+/** Round up to the courier's 0.5 kg billing slab (also the cache bucket). */
+const weightSlab = (kg) => Math.max(0.5, Math.ceil((Number(kg) || DEFAULT_QUOTE_KG) * 2) / 2);
 
 /**
- * Can a Shiprocket courier deliver to this PIN?
- * @returns {Promise<{ serviceable: boolean, eta: string|null }|null>} null = unknown
- *   (Shiprocket disabled or unreachable) — callers then fall back to the admin config.
+ * Can a Shiprocket courier deliver this parcel weight to this PIN?
+ * @returns {Promise<{ serviceable: boolean, eta: string|null, rate: number|null,
+ *   express: { eta: string|null, rate: number }|null }|null>}
+ *   null = unknown (Shiprocket disabled or unreachable) — callers then fall back
+ *   to the admin config. `express` = fastest non-surface (air/express) courier.
  */
-async function getCourierServiceability(pincode) {
+async function getCourierServiceability(pincode, weightKg) {
   if (!shiprocket.isEnabled()) return null;
-  const hit = _serviceCache.get(pincode);
+  const slab = weightSlab(weightKg);
+  const key = `${pincode}:${slab}`;
+  const hit = _serviceCache.get(key);
   if (hit && Date.now() - hit.at < SERVICE_TTL_MS) return hit.value;
   try {
-    const r = await shiprocket.checkServiceability({ deliveryPincode: pincode });
-    let eta = null;
+    const r = await shiprocket.checkServiceability({ deliveryPincode: pincode, weightKg: slab });
+    // Courier transit days + our 1–2 working-day dispatch window (see Shipping Policy).
+    const etaFor = (c) => (c?.estimatedDays ? `${c.estimatedDays + 1}–${c.estimatedDays + 2} business days` : null);
+    let value = { serviceable: false, eta: null, rate: null, courierId: null, courierName: null, express: null };
     if (r.serviceable) {
-      const rec = r.couriers.find((c) => c.courierId === r.recommendedId) || r.couriers[0];
-      // Courier transit days + our 1–2 working-day dispatch window (see Shipping Policy).
-      if (rec?.estimatedDays) eta = `${rec.estimatedDays + 1}–${rec.estimatedDays + 2} business days`;
+      // Standard = the CHEAPEST courier for this parcel; that's what we quote,
+      // charge (in 'actual' mode) and assign at dispatch.
+      const pick = pickCheapestCourier(r.couriers)
+        || r.couriers.find((c) => c.courierId === r.recommendedId) || r.couriers[0];
+      const express = pickExpressCourier(r.couriers);
+      value = {
+        serviceable: true,
+        eta: etaFor(pick),
+        rate: pick?.rate || null,
+        courierId: pick?.courierId ?? null,
+        courierName: pick?.name || null,
+        express: express
+          ? { eta: etaFor(express), rate: express.rate, courierId: express.courierId, courierName: express.name || null }
+          : null,
+      };
     }
-    const value = { serviceable: r.serviceable, eta };
     if (_serviceCache.size >= SERVICE_CACHE_MAX) _serviceCache.delete(_serviceCache.keys().next().value);
-    _serviceCache.set(pincode, { at: Date.now(), value });
+    _serviceCache.set(key, { at: Date.now(), value });
     return value;
   } catch (err) {
     log.warn('delivery.shiprocket_serviceability_failed', { pincode, err });
@@ -145,20 +225,23 @@ async function getCourierServiceability(pincode) {
 /* ── the resolver ──────────────────────────────────────────────────────── */
 
 /**
- * @param {{ pincode?: string, subtotal?: number }} input
+ * @param {{ pincode?: string, subtotal?: number, weightKg?: number }} input
+ *   weightKg — the cart's billable parcel weight (packageService.quoteWeightKg)
  * @returns {Promise<{
  *   pincode: string|null,
  *   pincodeKnown: boolean,
  *   city: string|null,
  *   state: string|null,
+ *   partner: 'shiprocket'|'local',
  *   deliveryAvailable: boolean,
  *   reason: string|null,
  *   standard: { available: boolean, fee: number, eta: string },
  *   fastest:  { available: boolean, fee: number, eta: string, reason: string|null },
  *   freeDeliveryApplied: boolean,
+ *   estimatedShippingCost: number|null,   // INTERNAL — strip before sending to customers
  * }>}
  */
-async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
+async function resolveDeliveryOptions({ pincode, subtotal = 0, weightKg } = {}) {
   const pin = normalisePincode(pincode);
   const sub = Math.max(0, Number(subtotal) || 0);
   const settings = await getGlobalSettings();
@@ -168,12 +251,14 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
     pincodeKnown: false,
     city: null,
     state: null,
+    partner: 'shiprocket',
     deliveryAvailable: false,
     reason: null,
     standard: { available: false, fee: 0, eta: settings.defaultStandardEta },
     fastest: { available: false, fee: 0, eta: settings.defaultFastestEta, reason: null },
     freeDeliveryApplied: false,
     cutoffTime: settings.fastestCutoffTime || null,
+    estimatedShippingCost: null,
   };
 
   if (pin && !isValidPincode(pin)) {
@@ -182,8 +267,8 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
   }
 
   const rule = pin ? await getPincodeRule(pin) : null;
+  out.partner = partnerOf(rule);
 
-  // ── standard ──
   if (rule) {
     out.pincodeKnown = true;
     out.city = rule.city || null;
@@ -192,26 +277,31 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
       out.reason = 'We do not deliver to this PIN code yet.';
       return out;
     }
-    out.standard.available = true;
-    out.standard.fee = standardFeeTypeOf(rule) === 'custom'
-      ? clampFee(rule.standardDeliveryFee, settings.defaultDeliveryFee)
-      : settings.defaultDeliveryFee;
-    if (rule.standardDeliveryEta) out.standard.eta = String(rule.standardDeliveryEta).slice(0, 60);
-  } else if (settings.serviceByDefault) {
-    // No admin rule for this PIN → ask our courier partner (Shiprocket) whether it
-    // is serviceable. An explicit admin PIN rule always takes precedence.
-    const courier = pin ? await getCourierServiceability(pin) : null;
-    if (courier && !courier.serviceable) {
-      out.reason = 'Our courier partners do not deliver to this PIN code yet.';
-      return out;
-    }
-    out.standard.available = true;
-    out.standard.fee = settings.defaultDeliveryFee;
-    if (courier?.eta) out.standard.eta = courier.eta;
-  } else {
+  } else if (!settings.serviceByDefault) {
     out.reason = 'Delivery is currently unavailable for this PIN code.';
     return out;
   }
+
+  // ── courier check (Shiprocket PINs only, rule or not) ──
+  const courier = pin && out.partner === 'shiprocket' ? await getCourierServiceability(pin, weightKg) : null;
+  if (courier && !courier.serviceable) {
+    out.reason = 'Our courier partners do not deliver to this PIN code yet.';
+    return out;
+  }
+  if (courier?.rate) {
+    out.estimatedShippingCost = courier.rate;
+    out.standard.courier = { courierId: courier.courierId, name: courier.courierName, rate: courier.rate };
+  }
+
+  // ── standard ──
+  out.standard.available = true;
+  if (rule && standardFeeTypeOf(rule) === 'custom') {
+    out.standard.fee = clampFee(rule.standardDeliveryFee, settings.defaultDeliveryFee);
+  } else {
+    out.standard.fee = courierLinkedFeeFor(courier?.rate, settings) ?? settings.defaultDeliveryFee;
+  }
+  if (rule?.standardDeliveryEta) out.standard.eta = String(rule.standardDeliveryEta).slice(0, 60);
+  else if (courier?.eta) out.standard.eta = courier.eta;
 
   // ── free-delivery override (standard only) ──
   if (settings.freeDeliveryEnabled && sub >= settings.freeDeliveryThreshold && sub > 0) {
@@ -232,8 +322,21 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
     );
     let available = true;
     let reason = null;
+    let eta = (rule && rule.fastestDeliveryEta) ? String(rule.fastestDeliveryEta).slice(0, 60) : settings.defaultFastestEta;
 
-    if (settings.fastestMinOrderValue > 0 && sub > 0 && sub < settings.fastestMinOrderValue) {
+    // Fastest on Shiprocket = an air/express courier must serve this PIN.
+    if (courier && !courier.express) {
+      available = false;
+      reason = 'Fastest delivery is not available for this PIN code.';
+    } else if (courier?.express?.eta && !(rule && rule.fastestDeliveryEta)) {
+      eta = courier.express.eta;
+    }
+    // 'actual' mode charges the express courier's real cost unless the PIN has its own fastest fee.
+    const pinFastestFee = rule && rule.fastestDeliveryFee != null;
+    if (courier?.express && !pinFastestFee && settings.courierFeeMode === 'actual') {
+      fee = courierLinkedFeeFor(courier.express.rate, settings) ?? fee;
+    }
+    if (available && settings.fastestMinOrderValue > 0 && sub > 0 && sub < settings.fastestMinOrderValue) {
       available = false;
       reason = `Fastest delivery needs a minimum order of ₹${settings.fastestMinOrderValue}.`;
     }
@@ -242,12 +345,10 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0 } = {}) {
       reason = `Fastest delivery is not available above ₹${settings.fastestMaxOrderValue}.`;
     }
 
-    out.fastest = {
-      available,
-      fee,
-      eta: (rule && rule.fastestDeliveryEta) ? String(rule.fastestDeliveryEta).slice(0, 60) : settings.defaultFastestEta,
-      reason,
-    };
+    out.fastest = { available, fee, eta, reason };
+    if (courier?.express) {
+      out.fastest.courier = { courierId: courier.express.courierId, name: courier.express.courierName, rate: courier.express.rate };
+    }
   }
 
   out.deliveryAvailable = out.standard.available;
@@ -268,12 +369,19 @@ class DeliveryError extends Error {
 
 /**
  * The ONLY function that decides what a customer is charged for delivery.
- * @returns {Promise<{ fee:number, method:'standard'|'fastest', eta:string, freeDeliveryApplied:boolean }>}
+ * @returns {Promise<{ fee:number, method:'standard'|'fastest', eta:string, freeDeliveryApplied:boolean,
+ *   partner:'shiprocket'|'local', estimatedShippingCost:number|null }>}
  * @throws DeliveryError('DELIVERY_UNAVAILABLE' | 'FASTEST_UNAVAILABLE' | 'INVALID_PINCODE')
  */
-async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0 } = {}) {
+async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0, weightKg } = {}) {
   const wanted = method === 'fastest' ? 'fastest' : 'standard';
-  const opts = await resolveDeliveryOptions({ pincode, subtotal });
+  const opts = await resolveDeliveryOptions({ pincode, subtotal, weightKg });
+  const extraFor = (o) => ({
+    partner: opts.partner,
+    // Freight + courier for the chosen method — saved on the order, assigned at dispatch.
+    estimatedShippingCost: o.courier?.rate ?? opts.estimatedShippingCost,
+    quotedCourier: o.courier || null,
+  });
 
   if (!opts.deliveryAvailable) {
     throw new DeliveryError('DELIVERY_UNAVAILABLE', opts.reason || 'Delivery is unavailable for this PIN code.');
@@ -283,7 +391,7 @@ async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0 }
     if (!opts.fastest.available) {
       throw new DeliveryError('FASTEST_UNAVAILABLE', opts.fastest.reason || 'Fastest delivery is not available for this order.');
     }
-    return { fee: opts.fastest.fee, method: 'fastest', eta: opts.fastest.eta, freeDeliveryApplied: false };
+    return { fee: opts.fastest.fee, method: 'fastest', eta: opts.fastest.eta, freeDeliveryApplied: false, ...extraFor(opts.fastest) };
   }
 
   return {
@@ -291,6 +399,7 @@ async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0 }
     method: 'standard',
     eta: opts.standard.eta,
     freeDeliveryApplied: opts.freeDeliveryApplied,
+    ...extraFor(opts.standard),
   };
 }
 
@@ -305,5 +414,10 @@ module.exports = {
   normalisePincode,
   clampFee,
   standardFeeTypeOf,
+  feeForCourierRate,
+  courierLinkedFeeFor,
+  pickCheapestCourier,
+  pickExpressCourier,
+  partnerOf,
   DeliveryError,
 };

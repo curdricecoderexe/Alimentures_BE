@@ -298,6 +298,7 @@ exports.listLeads = async (req, res) => {
           id: d.id,
           name: v.name,
           mobile: v.mobile,
+          document: v.document || 'catalogue', // 'catalogue' | 'fssai'
           catalogueFile: v.catalogueFile || null,
           createdAt: v.createdAt?.toDate ? v.createdAt.toDate().toISOString() : null,
         };

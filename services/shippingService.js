@@ -11,6 +11,17 @@
  * Courier updates only ever move an order FORWARD along the fulfilment chain
  * (plus the courier's own out_for_delivery → shipped re-attempt). Terminal
  * states (delivered / refunded / cancelled) are never touched.
+ *
+ * Exceptions don't change order.status; they set shipment.state / flags and
+ * alert staff once:
+ *   NDR (failed delivery attempt) → shipment.ndr       (staff call the customer)
+ *   RTO initiated / in transit    → 'rto_in_transit'  (parcel coming back)
+ *   RTO delivered                 → 'rto_delivered'   (inspect, then refund → restocks)
+ *   lost / damaged / destroyed    → 'lost'            (claim with Shiprocket, refund)
+ *   cancelled in Shiprocket       → 'cancelled'
+ *
+ * Orders whose PIN is served by the dedicated LOCAL partner
+ * (order.deliveryPartner === 'local') are never pushed automatically.
  */
 'use strict';
 
@@ -18,6 +29,8 @@ const admin = require('../lib/firebaseAdmin');
 const db = require('../config/firebase');
 const log = require('../lib/logger');
 const shiprocket = require('./shiprocketService');
+const packaging = require('./packageService');
+const { pickCheapestCourier, pickExpressCourier } = require('./deliveryService');
 const { ORDER_TRANSITIONS } = require('../config/constants');
 
 const PROVIDER = 'shiprocket';
@@ -30,22 +43,32 @@ const flowRank = (s) => (s === 'payment_successful_no_stock' ? 0 : FLOW.indexOf(
 
 /**
  * Map a Shiprocket shipment status label to an Alimenture order status.
- * Returns { status: string|null, exception: boolean }.
+ * Returns { status: string|null, exception: boolean, kind: string|null }.
+ * kind ∈ 'rto' | 'rto_delivered' | 'ndr' | 'lost' | 'cancelled' | 'exception'
  */
 function mapCourierStatus(raw) {
   const s = String(raw || '').trim().toUpperCase().replace(/_/g, ' ');
-  if (!s) return { status: null, exception: false };
-  if (/^RTO|UNDELIVERED|LOST|DAMAGED|DESTROYED|CANCEL|DISPOSED|MISROUTED/.test(s) || s.includes('RTO')) {
-    return { status: null, exception: true };
+  const ex = (kind) => ({ status: null, exception: true, kind });
+  if (!s) return { status: null, exception: false, kind: null };
+  if (s.includes('RTO') || /RETURN(ED)? TO ORIGIN/.test(s)) {
+    return ex(/DELIVERED/.test(s) && !/UNDELIVERED/.test(s) ? 'rto_delivered' : 'rto');
   }
-  if (s === 'DELIVERED') return { status: 'delivered', exception: false };
-  if (s.includes('OUT FOR DELIVERY')) return { status: 'out_for_delivery', exception: false };
+  if (/LOST|DAMAGED|DESTROYED|DISPOSED/.test(s)) return ex('lost');
+  if (/CANCEL/.test(s)) return ex('cancelled');
+  if (/UNDELIVERED|NDR|DELIVERY FAILED|FAILED DELIVERY|NOT DELIVERED/.test(s)) return ex('ndr');
+  if (/MISROUTED/.test(s)) return ex('exception');
+  if (s === 'DELIVERED') return { status: 'delivered', exception: false, kind: null };
+  if (s.includes('OUT FOR DELIVERY')) return { status: 'out_for_delivery', exception: false, kind: null };
   if (/PICKED UP|SHIPPED|IN TRANSIT|REACHED|DESTINATION HUB|AT HUB|DELAYED/.test(s)) {
-    return { status: 'shipped', exception: false };
+    return { status: 'shipped', exception: false, kind: null };
   }
-  if (/PICKUP|MANIFEST|AWB|LABEL|READY TO SHIP/.test(s)) return { status: 'packed', exception: false };
-  return { status: null, exception: false };
+  if (/PICKUP|MANIFEST|AWB|LABEL|READY TO SHIP/.test(s)) return { status: 'packed', exception: false, kind: null };
+  return { status: null, exception: false, kind: null };
 }
+
+/** Shipment states after which forward courier scans no longer move the order. */
+const HALTED_STATES = Object.freeze(['rto_in_transit', 'rto_delivered', 'lost', 'cancelled']);
+const STATE_FOR_KIND = Object.freeze({ rto: 'rto_in_transit', rto_delivered: 'rto_delivered', lost: 'lost', cancelled: 'cancelled' });
 
 /** May a courier-driven update move `current` → `target`? */
 function canAdvance(current, target) {
@@ -81,8 +104,11 @@ const CLAIM_TTL_MS = 2 * 60 * 1000;
 /**
  * Push an order to Shiprocket. Idempotent: an order that already has a
  * Shiprocket shipment is returned as-is.
+ * @param {{ source?: string, packageOverride?: object }} opts
+ *   packageOverride — `{ boxId }` or `{ length, breadth, height }`, optional `weightKg`
+ *   (validated by packageService.parseOverride). Omit for automatic box selection.
  */
-async function createShipmentForOrder(orderId, { source = 'admin' } = {}) {
+async function createShipmentForOrder(orderId, { source = 'admin', packageOverride = null, force = false } = {}) {
   assertEnabled();
   const orderRef = db.collection('orders').doc(orderId);
 
@@ -96,12 +122,20 @@ async function createShipmentForOrder(orderId, { source = 'admin' } = {}) {
     if (!SHIPPABLE_STATES.includes(order.status)) {
       throw new ShippingError('NOT_SHIPPABLE', `Order in "${order.status}" state cannot be shipped`);
     }
+    if (order.deliveryPartner === 'local' && !force) {
+      throw new ShippingError('LOCAL_PARTNER', 'This PIN code is delivered by your local delivery partner. Use "Ship via Shiprocket anyway" to override.', 409);
+    }
     const claimAt = sh.claimedAt?.toMillis ? sh.claimedAt.toMillis() : 0;
     if (sh.state === 'creating' && Date.now() - claimAt < CLAIM_TTL_MS) {
       throw new ShippingError('BUSY', 'Shipment creation already in progress', 409);
     }
     t.update(orderRef, {
-      shipment: { provider: PROVIDER, state: 'creating', claimedAt: admin.firestore.Timestamp.now() },
+      shipment: {
+        provider: PROVIDER,
+        state: 'creating',
+        claimedAt: admin.firestore.Timestamp.now(),
+        retryCount: Number(sh.retryCount) || 0,
+      },
       updatedAt: now(),
     });
     return { order };
@@ -111,13 +145,31 @@ async function createShipmentForOrder(orderId, { source = 'admin' } = {}) {
   const ci = claimed.order.customerInfo || {};
   if (!ci.pincode || !ci.state || !ci.phone) {
     await orderRef.update({
-      shipment: { provider: PROVIDER, state: 'failed', error: 'Address is missing PIN code, state or phone', updatedAt: admin.firestore.Timestamp.now() },
+      shipment: {
+        provider: PROVIDER, state: 'failed', error: 'Address is missing PIN code, state or phone',
+        retryCount: Number(claimed.order.shipment?.retryCount) || 0, updatedAt: admin.firestore.Timestamp.now(),
+      },
     });
     throw new ShippingError('INCOMPLETE_ADDRESS', 'Order address is missing PIN code, state or phone number');
   }
 
   try {
-    const created = await shiprocket.createOrder(orderId, claimed.order);
+    let pkg;
+    // No staff choice → the box the delivery fee was quoted for at checkout
+    // (falls back to auto-fit if that box was since removed from the catalogue).
+    const planned = claimed.order.plannedPackage?.boxId;
+    try {
+      if (!packageOverride && planned) {
+        pkg = await packaging.resolveOrderPackage(claimed.order, { boxId: planned })
+          .then((p) => ({ ...p, source: 'checkout' }))
+          .catch((err) => (err.code === 'BAD_BOX' ? null : Promise.reject(err)));
+      }
+      if (!pkg) pkg = await packaging.resolveOrderPackage(claimed.order, packageOverride);
+    } catch (err) {
+      if (err.code === 'BAD_BOX') throw new ShippingError('BAD_PACKAGE', err.message);
+      throw err;
+    }
+    const created = await shiprocket.createOrder(orderId, claimed.order, pkg);
     const shipment = {
       provider: PROVIDER,
       state: 'created',
@@ -125,6 +177,17 @@ async function createShipmentForOrder(orderId, { source = 'admin' } = {}) {
       shipmentId: created.shipmentId,
       courierStatus: created.srStatus,
       weightKg: created.weightKg,
+      package: {
+        boxId: pkg.boxId,
+        boxName: pkg.boxName,
+        length: pkg.length,
+        breadth: pkg.breadth,
+        height: pkg.height,
+        weightKg: pkg.weightKg,
+        volumetricKg: pkg.volumetricKg,
+        chargeableKg: pkg.chargeableKg,
+        source: pkg.source,
+      },
       createdAt: admin.firestore.Timestamp.now(),
       createdBy: source,
     };
@@ -133,19 +196,101 @@ async function createShipmentForOrder(orderId, { source = 'admin' } = {}) {
     return shipment;
   } catch (err) {
     await orderRef.update({
-      shipment: { provider: PROVIDER, state: 'failed', error: String(err.message).slice(0, 300), updatedAt: admin.firestore.Timestamp.now() },
+      shipment: {
+        provider: PROVIDER, state: 'failed', error: String(err.message).slice(0, 300),
+        retryCount: Number(claimed.order.shipment?.retryCount) || 0, updatedAt: admin.firestore.Timestamp.now(),
+      },
     }).catch(() => {});
     throw err;
   }
 }
 
+const autoCreateOn = () => shiprocket.isEnabled() && process.env.SHIPROCKET_AUTO_CREATE !== 'false';
+
 /** Fire-and-forget hook used after payment confirmation. Never throws. */
 async function autoCreateShipment(orderId) {
-  if (!shiprocket.isEnabled() || process.env.SHIPROCKET_AUTO_CREATE === 'false') return;
+  if (!autoCreateOn()) return;
   try {
     await createShipmentForOrder(orderId, { source: 'auto' });
   } catch (err) {
+    if (err instanceof ShippingError && err.code === 'LOCAL_PARTNER') return; // delivered by the local partner
     log.warn('shipping.auto_create_failed', { orderId, err });
+  }
+}
+
+/* ── 1b. retry job ─────────────────────────────────────────────────────── */
+
+const RETRY_MAX = 3;
+const RETRY_MIN_AGE_MS = 10 * 60 * 1000;
+const RETRY_SCAN_LIMIT = 200;
+const tsMs = (t) => (t?.toMillis ? t.toMillis() : (t ? new Date(t).getTime() || 0 : 0));
+
+/**
+ * Re-push paid orders whose automatic Shiprocket push failed or never ran.
+ * Gives up after RETRY_MAX attempts and flags the order (shipment.needsAttention).
+ * @param {{ onGiveUp?: (orderId: string, error: string) => void }} [hooks]
+ * @returns {Promise<{ scanned: number, retried: number, succeeded: number, gaveUp: number }>}
+ */
+async function retryFailedShipments({ onGiveUp } = {}) {
+  const out = { scanned: 0, retried: 0, succeeded: 0, gaveUp: 0 };
+  if (!autoCreateOn()) return out;
+  // A paused Shiprocket login would fail every order and burn its retries — wait it out.
+  if (shiprocket.authStatus().paused) return { ...out, skipped: 'login_paused' };
+  const snap = await db.collection('orders')
+    .where('status', 'in', ['pending', 'processing'])
+    .limit(RETRY_SCAN_LIMIT)
+    .get();
+  const cutoff = Date.now() - RETRY_MIN_AGE_MS;
+
+  for (const doc of snap.docs) {
+    out.scanned += 1;
+    const o = doc.data();
+    const sh = o.shipment || {};
+    if (o.deliveryPartner === 'local' || sh.shipmentId || sh.needsAttention) continue;
+    const stale = !sh.state || sh.state === 'failed'
+      || (sh.state === 'creating' && tsMs(sh.claimedAt) < Date.now() - CLAIM_TTL_MS);
+    if (!stale) continue;
+    if (tsMs(o.paidAt || o.createdAt) > cutoff) continue; // the first auto-push may still be running
+    const attempts = Number(sh.retryCount) || 0;
+    if (attempts >= RETRY_MAX) continue;
+
+    out.retried += 1;
+    try {
+      await createShipmentForOrder(doc.id, { source: 'retry' });
+      out.succeeded += 1;
+      log.info('shipping.retry_ok', { orderId: doc.id, attempt: attempts + 1 });
+    } catch (err) {
+      const giveUp = attempts + 1 >= RETRY_MAX;
+      await doc.ref.update({
+        'shipment.retryCount': attempts + 1,
+        ...(giveUp ? { 'shipment.needsAttention': true } : {}),
+      }).catch(() => {});
+      log.warn('shipping.retry_failed', { orderId: doc.id, attempt: attempts + 1, err });
+      if (giveUp) {
+        out.gaveUp += 1;
+        onGiveUp?.(doc.id, String(err.message || err).slice(0, 200));
+      }
+    }
+  }
+  return out;
+}
+
+/** Preview the parcel (box, size, weight) an order would be shipped in. */
+async function previewPackage(orderId, override = null) {
+  const snap = await db.collection('orders').doc(orderId).get();
+  if (!snap.exists) throw new ShippingError('NOT_FOUND', 'Order not found', 404);
+  const order = snap.data();
+  const planned = order.plannedPackage?.boxId;
+  try {
+    if (!override && planned) {
+      const p = await packaging.resolveOrderPackage(order, { boxId: planned }).catch(() => null);
+      if (p) return { ...p, source: 'checkout', planned: order.plannedPackage };
+    }
+    const p = await packaging.resolveOrderPackage(order, override);
+    return order.plannedPackage ? { ...p, planned: order.plannedPackage } : p;
+  } catch (err) {
+    if (err.code === 'BAD_BOX') throw new ShippingError('BAD_PACKAGE', err.message);
+    throw err;
   }
 }
 
@@ -157,7 +302,21 @@ async function listCouriers(orderId) {
   if (!snap.exists) throw new ShippingError('NOT_FOUND', 'Order not found', 404);
   const sh = snap.data().shipment || {};
   if (!sh.srOrderId) throw new ShippingError('NO_SHIPMENT', 'Create the Shiprocket shipment first');
-  return shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
+  const r = await shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
+  const express = pickExpressCourier(r.couriers);
+  const cheapest = pickCheapestCourier(r.couriers);
+  const o = snap.data();
+  return {
+    ...r,
+    couriers: [...r.couriers].sort((a, b) => a.rate - b.rate),
+    expressId: express?.courierId || null,
+    cheapestId: cheapest?.courierId || null,
+    // What the default "Auto" pick in shipOrder() will assign.
+    defaultId: (o.deliveryMethod === 'fastest' ? express?.courierId : null) || cheapest?.courierId || null,
+    quotedCourier: o.quotedCourier || null,
+    deliveryFee: Number(o.deliveryFee ?? o.shipping) || 0,
+    deliveryMethod: o.deliveryMethod || 'standard',
+  };
 }
 
 /**
@@ -166,7 +325,7 @@ async function listCouriers(orderId) {
  * previous attempt stopped. Moves the order to `packed`.
  * @returns {{ shipment, statusChange: { from, to }|null }}
  */
-async function shipOrder(orderId, { courierId } = {}) {
+async function shipOrder(orderId, { courierId, force = false } = {}) {
   assertEnabled();
   const orderRef = db.collection('orders').doc(orderId);
   let snap = await orderRef.get();
@@ -174,19 +333,48 @@ async function shipOrder(orderId, { courierId } = {}) {
   let sh = snap.data().shipment || {};
 
   if (!sh.shipmentId) {
-    sh = await createShipmentForOrder(orderId);
+    sh = await createShipmentForOrder(orderId, { force });
   }
 
   const patch = {};
   if (!sh.awb) {
-    const awb = await shiprocket.assignAwb(sh.shipmentId, courierId ? Number(courierId) : undefined);
+    // Courier quotes for this shipment: freight estimate (margin) + express pick for "fastest".
+    let quotes = null;
+    try {
+      quotes = await shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
+    } catch (err) {
+      log.warn('shipping.quote_failed', { orderId, err });
+    }
+    // Default pick: express for fastest orders, otherwise the CHEAPEST courier
+    // for the real parcel (the same rule the checkout fee was quoted with).
+    let chosenId = courierId ? Number(courierId) : undefined;
+    let courierPick = chosenId ? 'staff' : 'recommended';
+    if (!chosenId && quotes) {
+      const express = snap.data().deliveryMethod === 'fastest' ? pickExpressCourier(quotes.couriers) : null;
+      const cheapest = pickCheapestCourier(quotes.couriers);
+      if (express) {
+        chosenId = express.courierId;
+        courierPick = 'express';
+      } else if (cheapest) {
+        chosenId = cheapest.courierId;
+        courierPick = snap.data().deliveryMethod === 'fastest' ? 'cheapest_no_express' : 'cheapest';
+      }
+    }
+
+    const awb = await shiprocket.assignAwb(sh.shipmentId, chosenId);
+    const assignedId = awb.courierId || chosenId || quotes?.recommendedId;
+    const quote = quotes?.couriers.find((c) => c.courierId === assignedId);
     Object.assign(patch, {
       'shipment.awb': awb.awb,
       'shipment.courierId': awb.courierId || null,
       'shipment.courierName': awb.courierName || null,
+      'shipment.courierPick': courierPick,
+      'shipment.freightEstimate': quote ? quote.rate : null,
       'shipment.state': 'awb_assigned',
       'shipment.awbAssignedAt': admin.firestore.Timestamp.now(),
-      'shipment.error': admin.firestore.FieldValue.delete(),
+      'shipment.error': courierPick === 'cheapest_no_express'
+        ? 'Fastest order, but no express courier serves this PIN — cheapest courier used'
+        : admin.firestore.FieldValue.delete(),
     });
     await orderRef.update(patch);
     sh = { ...sh, awb: awb.awb, courierName: awb.courierName };
@@ -227,7 +415,9 @@ async function shipOrder(orderId, { courierId } = {}) {
  * Persist courier tracking onto the order and advance its status when allowed.
  * `courierStatus` is the raw Shiprocket label; `forceStatus` lets shipOrder()
  * set `packed` directly.
- * @returns {Promise<{ from: string, to: string, order: object }|null>} the status change, if any
+ * @returns {Promise<{ from: string, to: string|null, order: object,
+ *   alert: null|'ndr'|'rto'|'rto_delivered'|'lost'|'cancelled'|'exception' }|null>}
+ *   null when nothing worth notifying happened.
  */
 async function applyTrackingUpdate(orderId, {
   courierStatus, etd, trackUrl, activities, awb, courierName, forceStatus,
@@ -237,31 +427,53 @@ async function applyTrackingUpdate(orderId, {
     const snap = await t.get(orderRef);
     if (!snap.exists) return null;
     const order = snap.data();
+    const prev = order.shipment || {};
 
-    const mapped = forceStatus ? { status: forceStatus, exception: false } : mapCourierStatus(courierStatus);
+    const mapped = forceStatus ? { status: forceStatus, exception: false, kind: null } : mapCourierStatus(courierStatus);
+    const label = String(courierStatus || '').toUpperCase();
     const update = { updatedAt: now(), 'shipment.lastSyncedAt': admin.firestore.Timestamp.now() };
-    if (courierStatus) update['shipment.courierStatus'] = String(courierStatus).toUpperCase();
+    if (courierStatus) update['shipment.courierStatus'] = label;
     if (etd) update['shipment.etd'] = String(etd);
     if (trackUrl) update['shipment.trackUrl'] = trackUrl;
-    if (awb && !order.shipment?.awb) update['shipment.awb'] = String(awb);
-    if (courierName && !order.shipment?.courierName) update['shipment.courierName'] = courierName;
+    if (awb && !prev.awb) update['shipment.awb'] = String(awb);
+    if (courierName && !prev.courierName) update['shipment.courierName'] = courierName;
     if (Array.isArray(activities) && activities.length) update['shipment.activities'] = activities.slice(0, 25);
-    if (mapped.exception) {
-      update['shipment.exception'] = String(courierStatus).toUpperCase();
-    } else if (mapped.status) {
-      update['shipment.exception'] = admin.firestore.FieldValue.delete();
-    }
-    if (mapped.status === 'delivered') update['shipment.state'] = 'delivered';
-    else if (mapped.status === 'shipped' || mapped.status === 'out_for_delivery') update['shipment.state'] = 'in_transit';
 
-    let change = null;
-    if (canAdvance(order.status, mapped.status)) {
+    let alert = null;
+    const halted = HALTED_STATES.includes(prev.state);
+
+    if (mapped.exception) {
+      update['shipment.exception'] = label;
+      const nextState = STATE_FOR_KIND[mapped.kind];
+      if (nextState && prev.state !== nextState) {
+        update['shipment.state'] = nextState;
+        update[`shipment.${nextState}At`] = admin.firestore.Timestamp.now();
+        alert = mapped.kind;
+      } else if (mapped.kind === 'ndr' && !halted) {
+        const ndrCount = (Number(prev.ndr?.count) || 0) + (prev.ndr?.status === label ? 0 : 1);
+        update['shipment.ndr'] = { status: label, count: ndrCount, at: admin.firestore.Timestamp.now() };
+        if (prev.ndr?.status !== label) alert = 'ndr';
+      } else if (mapped.kind === 'exception' && prev.exception !== label) {
+        alert = 'exception';
+      }
+    } else if (mapped.status && !halted) {
+      update['shipment.exception'] = admin.firestore.FieldValue.delete();
+      if (mapped.status === 'delivered') update['shipment.ndr'] = admin.firestore.FieldValue.delete();
+    }
+
+    if (!halted && !mapped.exception) {
+      if (mapped.status === 'delivered') update['shipment.state'] = 'delivered';
+      else if (mapped.status === 'shipped' || mapped.status === 'out_for_delivery') update['shipment.state'] = 'in_transit';
+    }
+
+    let to = null;
+    if (!halted && canAdvance(order.status, mapped.status)) {
       update.status = mapped.status;
       if (mapped.status === 'delivered') update.deliveredAt = now();
-      change = { from: order.status, to: mapped.status, order };
+      to = mapped.status;
     }
     t.update(orderRef, update);
-    return change;
+    return to || alert ? { from: order.status, to, order, alert } : null;
   });
 }
 
@@ -276,6 +488,41 @@ async function refreshTracking(orderId) {
   return applyTrackingUpdate(orderId, {
     courierStatus: tr.status, etd: tr.etd, trackUrl: tr.trackUrl, activities: tr.activities,
   });
+}
+
+/** Shipment states in which Shiprocket still allows cancellation (not yet picked up). */
+const CANCELLABLE_STATES = Object.freeze(['created', 'awb_assigned', 'pickup_scheduled', 'failed']);
+
+/**
+ * Cancel an order's Shiprocket shipment if the courier hasn't picked it up yet
+ * (used on refund). Never throws.
+ * @returns {Promise<'cancelled'|'not_needed'|'too_late'|'failed'>}
+ */
+async function cancelShipmentForOrder(orderId, { reason = 'refund' } = {}) {
+  const orderRef = db.collection('orders').doc(orderId);
+  try {
+    const snap = await orderRef.get();
+    const sh = snap.exists ? snap.data().shipment || {} : {};
+    if (!sh.srOrderId || ['cancelled', 'rto_in_transit', 'rto_delivered', 'lost'].includes(sh.state)) return 'not_needed';
+    if (!CANCELLABLE_STATES.includes(sh.state)) {
+      await orderRef.update({ 'shipment.error': `Not cancelled in Shiprocket on ${reason}: parcel already with the courier` });
+      return 'too_late';
+    }
+    if (!shiprocket.isEnabled()) throw new Error('Shiprocket is not configured');
+    await shiprocket.cancelOrder(sh.srOrderId);
+    await orderRef.update({
+      'shipment.state': 'cancelled',
+      'shipment.cancelledAt': admin.firestore.Timestamp.now(),
+      'shipment.cancelReason': reason,
+      'shipment.error': admin.firestore.FieldValue.delete(),
+    });
+    log.info('shipping.cancelled', { orderId, srOrderId: sh.srOrderId, reason });
+    return 'cancelled';
+  } catch (err) {
+    log.warn('shipping.cancel_failed', { orderId, err });
+    await orderRef.update({ 'shipment.error': `Shiprocket cancel failed: ${String(err.message).slice(0, 200)} — cancel it in the Shiprocket panel` }).catch(() => {});
+    return 'failed';
+  }
 }
 
 /** Find the order a Shiprocket webhook refers to (by AWB, then by our order id). */
@@ -303,6 +550,7 @@ function publicShipment(sh) {
     trackUrl: sh.trackUrl || (sh.awb ? `https://shiprocket.co/tracking/${sh.awb}` : null),
     etd: sh.etd || null,
     exception: sh.exception || null,
+    ndr: sh.ndr ? { status: sh.ndr.status, count: sh.ndr.count } : null,
     activities: sh.activities || [],
   };
 }
@@ -315,7 +563,11 @@ module.exports = {
   canAdvance,
   createShipmentForOrder,
   autoCreateShipment,
+  retryFailedShipments,
+  previewPackage,
   listCouriers,
+  pickExpressCourier,
+  cancelShipmentForOrder,
   shipOrder,
   applyTrackingUpdate,
   refreshTracking,

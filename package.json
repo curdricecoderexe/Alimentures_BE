@@ -1,7 +1,7 @@
 {
   "name": "alimentures-api",
   "version": "1.0.0",
-  "description": "Alimentures e-commerce backend — Express 5 + Firebase Admin (Firestore) + Razorpay",
+  "description": "Alimentures e-commerce backend \u2014 Express 5 + Firebase Admin (Firestore) + Razorpay",
   "license": "ISC",
   "author": "",
   "main": "index.js",
@@ -14,7 +14,9 @@
     "sim:webhook": "node scripts/simulate-webhook.js",
     "analytics:retention": "node scripts/analytics-retention.js",
     "test": "node --test test/",
-    "backfill:email-verified": "node scripts/backfill-email-verified.js"
+    "backfill:email-verified": "node scripts/backfill-email-verified.js",
+    "sr:test-login": "node scripts/shiprocket-test-login.js",
+    "check:env": "node scripts/check-env.js"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",

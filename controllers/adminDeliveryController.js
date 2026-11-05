@@ -17,7 +17,7 @@ const {
 } = require('../services/deliveryService');
 const {
   PINCODE_COLLECTION, SETTINGS_COLLECTION, SETTINGS_DOC,
-  FEE_MIN, FEE_MAX, CSV_HEADERS, BULK_MAX_ROWS, PINCODE_RE, STANDARD_FEE_TYPES,
+  FEE_MIN, FEE_MAX, CSV_HEADERS, BULK_MAX_ROWS, PINCODE_RE, STANDARD_FEE_TYPES, DELIVERY_PARTNERS,
 } = require('../config/deliveryConstants');
 
 const LIST_MAX = 500;
@@ -107,6 +107,15 @@ function cleanPincodePayload(body, { partial = false } = {}) {
   if (!partial || body.standardEta !== undefined) out.standardDeliveryEta = str(body.standardEta, 60);
   if (!partial || body.fastestEta !== undefined) out.fastestDeliveryEta = str(body.fastestEta, 60);
   if (!partial || body.note !== undefined) out.note = str(body.note, 300);
+
+  // Who delivers this PIN. Blank (e.g. older CSVs) → Shiprocket.
+  if (!partial || body.deliveryPartner !== undefined) {
+    const partner = str(body.deliveryPartner, 20).toLowerCase() || 'shiprocket';
+    if (!DELIVERY_PARTNERS.includes(partner)) {
+      return { error: `deliveryPartner must be one of: ${DELIVERY_PARTNERS.join(', ')}` };
+    }
+    out.deliveryPartner = partner;
+  }
 
   return { data: out };
 }
@@ -431,6 +440,7 @@ function parseCsv(text) {
       standardEta: get('standardEta'),
       fastestEta: get('fastestEta'),
       note: get('note'),
+      deliveryPartner: get('deliveryPartner'),
     };
   });
   return { rows };
@@ -466,6 +476,7 @@ exports.exportCsv = async (req, res) => {
         o.deliveryAvailable ? 'true' : 'false', standardFeeTypeOf(o) === 'custom' ? (o.standardDeliveryFee || 0) : '',
         o.fastestDeliveryAvailable ? 'true' : 'false', o.fastestDeliveryFee || 0,
         o.standardDeliveryEta || '', o.fastestDeliveryEta || '', o.note || '',
+        o.deliveryPartner || 'shiprocket',
       ].map(esc).join(','));
     });
     res.set('Content-Type', 'text/csv; charset=utf-8');

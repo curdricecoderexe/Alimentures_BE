@@ -6,6 +6,7 @@
 
 const log = require('../lib/logger');
 const locationService = require('../services/locationService');
+const { quotePackage, OVERSIZE_MESSAGE } = require('../services/packageService');
 const {
   resolveDeliveryOptions, isValidPincode, normalisePincode, getPincodeRule, getGlobalSettings,
 } = require('../services/deliveryService');
@@ -76,7 +77,36 @@ exports.getPincodeInfo = async (req, res) => {
 };
 
 /**
- * GET /api/delivery/options/:pincode?subtotal=1234
+ * Parse the optional `cart` query: JSON [[productId, selectedWeight, qty], …]
+ * (max 50 lines). Only used to size the parcel for the courier check.
+ */
+function parseCartQuery(raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 4000) return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.slice(0, 50)
+      .filter((l) => Array.isArray(l) && typeof l[0] === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(l[0]))
+      .map(([productId, selectedWeight, qty]) => ({
+        productId,
+        selectedWeight: typeof selectedWeight === 'string' ? selectedWeight.slice(0, 40) : '',
+        quantity: Math.min(50, Math.max(1, Number.parseInt(qty, 10) || 1)),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** Customer-safe copy of the resolver output (our freight cost stays private). */
+function publicOptions(opts) {
+  const { estimatedShippingCost, ...rest } = opts;
+  // Courier name + freight are internal too.
+  const strip = (m) => { if (!m) return m; const { courier, ...pub } = m; return pub; };
+  return { ...rest, standard: strip(rest.standard), fastest: strip(rest.fastest) };
+}
+
+/**
+ * GET /api/delivery/options/:pincode?subtotal=1234&cart=[["pid","500g",2]]
  * Full delivery-option payload for the checkout screen. This is an ESTIMATE —
  * the authoritative fee is recomputed at order creation.
  */
@@ -87,8 +117,16 @@ exports.getDeliveryOptions = async (req, res) => {
       return res.status(400).json({ success: false, error: 'PIN code must be 6 digits' });
     }
     const subtotal = Math.max(0, Number(req.query.subtotal) || 0);
-    const opts = await resolveDeliveryOptions({ pincode, subtotal });
-    return res.status(200).json({ success: true, data: opts });
+    const pkg = await quotePackage(parseCartQuery(req.query.cart));
+    const opts = await resolveDeliveryOptions({ pincode, subtotal, weightKg: pkg?.chargeableKg ?? null });
+    if (pkg?.oversize && opts.partner !== 'local') {
+      // Shiprocket PIN + bulk cart bigger than the largest box: no fee can be quoted — block before payment.
+      opts.deliveryAvailable = false;
+      opts.reason = OVERSIZE_MESSAGE;
+      opts.standard = { ...opts.standard, available: false };
+      if (opts.fastest) opts.fastest = { ...opts.fastest, available: false };
+    }
+    return res.status(200).json({ success: true, data: publicOptions(opts) });
   } catch (err) {
     log.error('delivery.options_failed', { requestId: req.id, err });
     return res.status(500).json({ success: false, error: 'Failed to load delivery options' });
