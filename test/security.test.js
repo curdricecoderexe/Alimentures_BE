@@ -114,3 +114,26 @@ test('unknown API routes are a clean JSON 404', async () => {
   assert.equal(r.status, 404);
   assert.deepEqual(await r.json(), { success: false, error: 'Not found' });
 });
+
+// ── Shiprocket webhook (panel "Test" button sends odd content types) ─────────
+test('Shiprocket webhook: token-checked, any content type, padded token accepted', async () => {
+  process.env.SHIPROCKET_WEBHOOK_TOKEN = 'sr-secret-123';
+  try {
+    const post = (headers, body) => fetch(`${base}/api/shipping/webhook`, { method: 'POST', headers, body });
+    const sample = JSON.stringify({ awb: '19041424751540', current_status: 'IN TRANSIT', order_id: 'test-order' });
+
+    assert.equal((await post({ 'content-type': 'application/json' }, sample)).status, 401, 'no token');
+    assert.equal((await post({ 'content-type': 'application/json', 'x-api-key': 'nope' }, sample)).status, 401, 'wrong token');
+
+    for (const type of ['application/json', 'text/plain', 'application/x-www-form-urlencoded', '']) {
+      const r = await post({ 'content-type': type, 'x-api-key': ' sr-secret-123 ' }, sample);
+      assert.equal(r.status, 200, `content-type "${type}"`);
+      assert.equal((await r.json()).ignored, 'unknown order');
+    }
+    // Empty / malformed bodies still answer 200 (Shiprocket disables failing webhooks).
+    assert.equal((await post({ 'x-api-key': 'sr-secret-123' }, '')).status, 200);
+    assert.equal((await post({ 'content-type': 'application/json', 'x-api-key': 'sr-secret-123' }, '{bad')).status, 200);
+  } finally {
+    delete process.env.SHIPROCKET_WEBHOOK_TOKEN;
+  }
+});

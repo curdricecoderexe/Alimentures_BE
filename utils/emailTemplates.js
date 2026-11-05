@@ -565,4 +565,74 @@ function buildWelcomeEmail({ products = [], unsubscribeUrl }) {
   };
 }
 
-module.exports = { buildOrderEmail, buildOtpEmail, buildWelcomeEmail, emailShell, BRAND, money, shortId, fmtDate, SITE_URL };
+/**
+ * Internal "new paid order" alert for the shop team (ORDER_ALERT_EMAILS).
+ * Everything needed to pack and ship without opening the admin panel.
+ */
+function buildAdminOrderAlert({ order, orderId }) {
+  const sid = shortId(orderId);
+  const ci = order.customerInfo || {};
+  const items = order.items || [];
+  const name = ci.name || `${ci.firstName || ''} ${ci.lastName || ''}`.trim() || 'Customer';
+  const method = order.deliveryMethod === 'fastest' ? 'Fastest' : 'Standard';
+  const pay = order.paymentDetails?.detail || order.paymentDetails?.method || 'Online (Razorpay)';
+  const adminUrl = `${SITE_URL}/admin/orders?orderId=${encodeURIComponent(orderId)}`;
+  const addressLines = [ci.address, [ci.city, ci.state].filter(Boolean).join(', '), ci.pincode].filter(Boolean);
+  const kv = (k, v) => (v ? `
+      <tr>
+        <td style="padding:5px 0;width:120px;vertical-align:top;font:600 12.5px/1.5 ${BODY};color:${BRAND.muted}">${esc(k)}</td>
+        <td style="padding:5px 0;font:600 13.5px/1.5 ${BODY};color:${BRAND.ink}">${v}</td>
+      </tr>` : '');
+
+  const content = `
+        <tr><td class="px" style="padding:22px 30px 6px">
+          ${sectionLabel('Customer')}
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            ${kv('Name', esc(name))}
+            ${kv('Phone', ci.phone ? `<a href="tel:${esc(ci.phone)}" style="color:${BRAND.berry}">${esc(ci.phone)}</a>` : '')}
+            ${kv('Email', ci.email ? `<a href="mailto:${esc(ci.email)}" style="color:${BRAND.berry}">${esc(ci.email)}</a>` : '')}
+            ${kv('Address', addressLines.map(esc).join('<br>'))}
+            ${kv('Delivery', esc(`${method}${order.deliveryEstimate ? ` · ${order.deliveryEstimate}` : ''}${order.deliveryPartner === 'local' ? ' · LOCAL PARTNER' : ''}`))}
+            ${kv('Payment', esc(`${pay}${order.razorpayPaymentId ? ` · ${order.razorpayPaymentId}` : ''}`))}
+          </table>
+        </td></tr>
+        <tr><td class="px" style="padding:14px 30px 6px">
+          ${sectionLabel(`Items (${items.length})`)}
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">${itemRows(items, [])}</table>
+          ${totalsBlock(order)}
+        </td></tr>`;
+
+  const text = [
+    `New paid order ${sid} — ${money(order.totalAmount)}`,
+    '',
+    `Customer: ${name}`,
+    ci.phone ? `Phone: ${ci.phone}` : '',
+    ci.email ? `Email: ${ci.email}` : '',
+    `Address: ${addressLines.join(', ')}`,
+    `Delivery: ${method}${order.deliveryPartner === 'local' ? ' (local partner)' : ''}`,
+    '',
+    'Items:',
+    ...items.map((it) => `- ${it.name} ${it.selectedWeight || ''} × ${Number(it.quantity) || 1} = ${money((Number(it.price) || 0) * (Number(it.quantity) || 1))}`),
+    '',
+    `Delivery fee: ${money(order.deliveryFee ?? order.shipping)}`,
+    order.discountAmount > 0 ? `Discount: −${money(order.discountAmount)}` : '',
+    `Total: ${money(order.totalAmount)}`,
+    '',
+    `Open in admin: ${adminUrl}`,
+  ].filter((l) => l !== '').join('\n');
+
+  return {
+    subject: `🛒 New order ${sid} · ${money(order.totalAmount)} · ${name}${ci.city ? `, ${ci.city}` : ''}`,
+    text,
+    html: emailShell({
+      preheader: `${name} · ${items.length} item(s) · ${money(order.totalAmount)}`,
+      eyebrow: 'New paid order',
+      heading: `Order ${sid}`,
+      blurb: `${name} just paid ${money(order.totalAmount)}. Pack and ship from the admin panel.`,
+      cta: { href: adminUrl, label: 'Open order in admin' },
+      content,
+    }),
+  };
+}
+
+module.exports = { buildOrderEmail, buildAdminOrderAlert, buildOtpEmail, buildWelcomeEmail, emailShell, BRAND, money, shortId, fmtDate, SITE_URL };

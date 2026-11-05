@@ -38,7 +38,12 @@ const DEFAULT_BOXES = Object.freeze([
   { id: 'BX-M', name: 'Medium', length: 22, breadth: 16, height: 10, boxWeightKg: 0.11, maxWeightKg: 1.5, isActive: true },
   { id: 'BX-L', name: 'Large', length: 30, breadth: 22, height: 14, boxWeightKg: 0.18, maxWeightKg: 3.5, isActive: true },
   { id: 'BX-XL', name: 'Extra large', length: 36, breadth: 28, height: 18, boxWeightKg: 0.26, maxWeightKg: 7, isActive: true },
+  // Bulk orders ship as ONE big carton. Orders that don't fit the largest active
+  // box are refused at checkout (see OVERSIZE_MESSAGE) — add bigger cartons here.
+  { id: 'BX-C20', name: 'Bulk carton', length: 45, breadth: 35, height: 30, boxWeightKg: 0.6, maxWeightKg: 20, isActive: true },
 ]);
+
+const OVERSIZE_MESSAGE = 'This order is too large to ship as one parcel. Please reduce the quantity or contact us for a bulk order quote.';
 
 const envNum = (k, d) => (Number(process.env[k]) > 0 ? Number(process.env[k]) : d);
 
@@ -280,6 +285,7 @@ function buildPackage(items = [], settings = normaliseSettings(), override = nul
 
   let box = null;
   let fits = true;
+  let oversize = false; // auto-fit found no box big enough → refuse at checkout
   let source = 'auto';
   let dims;
 
@@ -298,6 +304,7 @@ function buildPackage(items = [], settings = normaliseSettings(), override = nul
     if (!box) {
       box = active[active.length - 1];
       fits = false;
+      oversize = true;
       warnings.push('Contents exceed the largest box — split the order or enter a custom size');
     }
   } else if (active.length) {
@@ -332,6 +339,7 @@ function buildPackage(items = [], settings = normaliseSettings(), override = nul
     volumetricKg,
     chargeableKg: Math.max(weightKg, volumetricKg),
     fits,
+    oversize,
     source,
     warnings,
   };
@@ -367,18 +375,29 @@ async function resolveItemsPackage(rawItems = [], override = null) {
 const resolveOrderPackage = (order, override = null) => resolveItemsPackage(order.items || [], override);
 
 /**
- * Courier-billable weight (kg) for a cart, for serviceability / rate checks.
- * Never throws — falls back to null (callers then use their default slab).
+ * The parcel a cart will ship in (auto box), for checkout quotes. Never throws
+ * — null on failure (callers then use their default slab).
  */
-async function quoteWeightKg(items = []) {
+async function quotePackage(items = []) {
   if (!Array.isArray(items) || !items.length) return null;
   try {
-    return (await resolveItemsPackage(items)).chargeableKg;
+    return await resolveItemsPackage(items);
   } catch (err) {
     log.warn('packaging.quote_failed', { err });
     return null;
   }
 }
+
+/** Courier-billable weight (kg) for a cart, or null. */
+async function quoteWeightKg(items = []) {
+  return (await quotePackage(items))?.chargeableKg ?? null;
+}
+
+/** Compact parcel snapshot stored on an order (`plannedPackage`). */
+const packageSnapshot = (pkg) => (pkg ? {
+  boxId: pkg.boxId, boxName: pkg.boxName, length: pkg.length, breadth: pkg.breadth, height: pkg.height,
+  weightKg: pkg.weightKg, volumetricKg: pkg.volumetricKg, chargeableKg: pkg.chargeableKg,
+} : null);
 
 /** Validate a staff-supplied override from a request body. */
 function parseOverride(body) {
@@ -399,6 +418,7 @@ function parseOverride(body) {
 
 module.exports = {
   DEFAULT_BOXES,
+  OVERSIZE_MESSAGE,
   LIMITS,
   parseWeightKg,
   parseDims,
@@ -411,6 +431,8 @@ module.exports = {
   buildPackage,
   resolveItemsPackage,
   resolveOrderPackage,
+  quotePackage,
   quoteWeightKg,
+  packageSnapshot,
   parseOverride,
 };

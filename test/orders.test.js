@@ -153,6 +153,33 @@ test("verifyRazorpay won't confirm another customer's order", async () => {
   assert.equal(db.read(`orders/${orderId}`).status, 'payment_pending');
 });
 
+test("verifyRazorpay won't confirm an order with a payment made for a different order", async () => {
+  const cheap = await pendingOrder();
+  const dear = await pendingOrder();
+  // Genuine signature — but for the cheap order's Razorpay order.
+  const signature = sign(process.env.RAZORPAY_KEY_SECRET, `${cheap.rzpOrderId}|pay_cheap`);
+  const res = await verify({ orderId: dear.orderId, razorpay_order_id: cheap.rzpOrderId, razorpay_payment_id: 'pay_cheap', razorpay_signature: signature });
+  assert.equal(res.statusCode, 400);
+  assert.equal(db.read(`orders/${dear.orderId}`).status, 'payment_pending');
+});
+
+test('customers never see our courier cost, quoted courier or packing data', async () => {
+  const { orderId } = await pendingOrder();
+  db.seed(`orders/${orderId}`, {
+    ...db.read(`orders/${orderId}`),
+    estimatedShippingCost: 58, quotedCourier: { courierId: 2, name: 'C2', rate: 58 }, plannedPackage: { boxId: 'BX-S' },
+    shipment: { provider: 'shiprocket', state: 'awb_assigned', awb: 'AWB9', courierName: 'C2', freightEstimate: 58, package: { boxId: 'BX-S' } },
+  });
+  const res = mockRes();
+  await orders.getOrderById({ params: { id: orderId }, user: USER, id: 'req' }, res);
+  const o = res.body.data;
+  assert.equal(res.statusCode, 200);
+  for (const k of ['estimatedShippingCost', 'quotedCourier', 'plannedPackage']) assert.equal(o[k], undefined, k);
+  assert.equal(o.shipment.awb, 'AWB9');
+  assert.equal(o.shipment.freightEstimate, undefined);
+  assert.equal(o.shipment.package, undefined);
+});
+
 // ── Razorpay webhook ─────────────────────────────────────────────────────────
 
 async function webhook(payload, { signature, eventId } = {}) {

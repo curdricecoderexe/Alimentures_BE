@@ -41,9 +41,10 @@ test('label weight + pouch allowance is used when a variant has no packed weight
 });
 
 test('contents bigger than every box fall back to the largest and are flagged', () => {
-  const p = pkg.buildPackage([{ quantity: 10, selectedWeight: '1kg', shipWeightKg: 1.02 }], settings);
-  assert.equal(p.boxId, 'BX-XL');
+  const p = pkg.buildPackage([{ quantity: 30, selectedWeight: '1kg', shipWeightKg: 1.02 }], settings);
+  assert.equal(p.boxId, 'BX-C20');
   assert.equal(p.fits, false);
+  assert.equal(p.oversize, true);
   assert.ok(p.warnings.some((w) => /largest box/.test(w)));
 });
 

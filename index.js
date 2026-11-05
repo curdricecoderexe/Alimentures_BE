@@ -114,7 +114,6 @@ if (process.env.LOG_LEVEL !== 'silent') {
 // best-effort guess and may not match the real production frontend domain.
 const DEV_ORIGINS = ['http://localhost:5173', 'http://localhost:3000'];
 const PROD_ORIGINS = [
-  'https://alimentures.netlify.app',
   'https://alimenture.in',
   'https://www.alimenture.in',
 ];
@@ -141,6 +140,21 @@ app.use(cors(corsOptions));
 // before any JSON parser.
 app.use('/api/orders/razorpay/webhook', express.raw({ type: '*/*', limit: '1mb' }));
 
+// Shiprocket's webhook (incl. its panel "Test" button) doesn't always send a JSON
+// content type. It's authenticated by its x-api-key token, so accept any type
+// and parse the body as JSON, falling back to form fields.
+app.use('/api/shipping/webhook', express.text({ type: () => true, limit: '1mb' }), (req, _res, next) => {
+  if (typeof req.body !== 'string') return next();
+  const raw = req.body.trim();
+  try {
+    req.body = raw ? JSON.parse(raw) : {};
+  } catch {
+    req.body = Object.fromEntries(new URLSearchParams(raw));
+  }
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) req.body = {};
+  return next();
+});
+
 // Routes that legitimately carry inline base64 images (catalogue media, cart
 // item thumbnails, delivery proof-of-delivery photos). The first parser to
 // populate req.body wins.
@@ -158,8 +172,8 @@ const { rejectOperatorQuery, requireJsonBody } = require('./middlewares/requestG
 app.use('/api', rejectOperatorQuery);
 app.use('/api', requireJsonBody([
   { path: /^\/api\/orders\/razorpay\/webhook$/, types: /.*/ },            // raw bytes for HMAC
-  { path: /^\/api\/catalogue\/admin\/file$/, types: /^application\/pdf\b/ }, // catalogue upload
-  { path: /^\/api\/shipping\/webhook$/, types: /^application\/(json|x-www-form-urlencoded)\b/ },
+  { path: /^\/api\/catalogue\/admin\/(fssai\/)?file$/, types: /^application\/pdf\b/ }, // catalogue / FSSAI upload
+  { path: /^\/api\/shipping\/webhook$/, types: /.*/ },                     // any type — token-authenticated
 ]));
 
 // ─── 7. RATE LIMITING ─────────────────────────────────────────────────────────

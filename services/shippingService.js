@@ -30,6 +30,7 @@ const db = require('../config/firebase');
 const log = require('../lib/logger');
 const shiprocket = require('./shiprocketService');
 const packaging = require('./packageService');
+const { pickCheapestCourier, pickExpressCourier } = require('./deliveryService');
 const { ORDER_TRANSITIONS } = require('../config/constants');
 
 const PROVIDER = 'shiprocket';
@@ -154,8 +155,16 @@ async function createShipmentForOrder(orderId, { source = 'admin', packageOverri
 
   try {
     let pkg;
+    // No staff choice → the box the delivery fee was quoted for at checkout
+    // (falls back to auto-fit if that box was since removed from the catalogue).
+    const planned = claimed.order.plannedPackage?.boxId;
     try {
-      pkg = await packaging.resolveOrderPackage(claimed.order, packageOverride);
+      if (!packageOverride && planned) {
+        pkg = await packaging.resolveOrderPackage(claimed.order, { boxId: planned })
+          .then((p) => ({ ...p, source: 'checkout' }))
+          .catch((err) => (err.code === 'BAD_BOX' ? null : Promise.reject(err)));
+      }
+      if (!pkg) pkg = await packaging.resolveOrderPackage(claimed.order, packageOverride);
     } catch (err) {
       if (err.code === 'BAD_BOX') throw new ShippingError('BAD_PACKAGE', err.message);
       throw err;
@@ -270,8 +279,15 @@ async function retryFailedShipments({ onGiveUp } = {}) {
 async function previewPackage(orderId, override = null) {
   const snap = await db.collection('orders').doc(orderId).get();
   if (!snap.exists) throw new ShippingError('NOT_FOUND', 'Order not found', 404);
+  const order = snap.data();
+  const planned = order.plannedPackage?.boxId;
   try {
-    return await packaging.resolveOrderPackage(snap.data(), override);
+    if (!override && planned) {
+      const p = await packaging.resolveOrderPackage(order, { boxId: planned }).catch(() => null);
+      if (p) return { ...p, source: 'checkout', planned: order.plannedPackage };
+    }
+    const p = await packaging.resolveOrderPackage(order, override);
+    return order.plannedPackage ? { ...p, planned: order.plannedPackage } : p;
   } catch (err) {
     if (err.code === 'BAD_BOX') throw new ShippingError('BAD_PACKAGE', err.message);
     throw err;
@@ -288,18 +304,19 @@ async function listCouriers(orderId) {
   if (!sh.srOrderId) throw new ShippingError('NO_SHIPMENT', 'Create the Shiprocket shipment first');
   const r = await shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
   const express = pickExpressCourier(r.couriers);
+  const cheapest = pickCheapestCourier(r.couriers);
+  const o = snap.data();
   return {
     ...r,
+    couriers: [...r.couriers].sort((a, b) => a.rate - b.rate),
     expressId: express?.courierId || null,
-    deliveryMethod: snap.data().deliveryMethod || 'standard',
+    cheapestId: cheapest?.courierId || null,
+    // What the default "Auto" pick in shipOrder() will assign.
+    defaultId: (o.deliveryMethod === 'fastest' ? express?.courierId : null) || cheapest?.courierId || null,
+    quotedCourier: o.quotedCourier || null,
+    deliveryFee: Number(o.deliveryFee ?? o.shipping) || 0,
+    deliveryMethod: o.deliveryMethod || 'standard',
   };
-}
-
-/** Fastest air/express courier: non-surface, fewest days, then cheapest. */
-function pickExpressCourier(couriers = []) {
-  return couriers
-    .filter((c) => !c.isSurface && c.estimatedDays)
-    .sort((a, b) => a.estimatedDays - b.estimatedDays || a.rate - b.rate)[0] || null;
 }
 
 /**
@@ -328,15 +345,19 @@ async function shipOrder(orderId, { courierId, force = false } = {}) {
     } catch (err) {
       log.warn('shipping.quote_failed', { orderId, err });
     }
+    // Default pick: express for fastest orders, otherwise the CHEAPEST courier
+    // for the real parcel (the same rule the checkout fee was quoted with).
     let chosenId = courierId ? Number(courierId) : undefined;
     let courierPick = chosenId ? 'staff' : 'recommended';
-    if (!chosenId && snap.data().deliveryMethod === 'fastest' && quotes) {
-      const express = pickExpressCourier(quotes.couriers);
+    if (!chosenId && quotes) {
+      const express = snap.data().deliveryMethod === 'fastest' ? pickExpressCourier(quotes.couriers) : null;
+      const cheapest = pickCheapestCourier(quotes.couriers);
       if (express) {
         chosenId = express.courierId;
         courierPick = 'express';
-      } else {
-        courierPick = 'recommended_no_express';
+      } else if (cheapest) {
+        chosenId = cheapest.courierId;
+        courierPick = snap.data().deliveryMethod === 'fastest' ? 'cheapest_no_express' : 'cheapest';
       }
     }
 
@@ -351,8 +372,8 @@ async function shipOrder(orderId, { courierId, force = false } = {}) {
       'shipment.freightEstimate': quote ? quote.rate : null,
       'shipment.state': 'awb_assigned',
       'shipment.awbAssignedAt': admin.firestore.Timestamp.now(),
-      'shipment.error': courierPick === 'recommended_no_express'
-        ? 'Fastest order, but no express courier serves this PIN — Shiprocket recommended courier used'
+      'shipment.error': courierPick === 'cheapest_no_express'
+        ? 'Fastest order, but no express courier serves this PIN — cheapest courier used'
         : admin.firestore.FieldValue.delete(),
     });
     await orderRef.update(patch);

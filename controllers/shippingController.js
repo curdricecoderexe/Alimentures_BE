@@ -285,8 +285,9 @@ exports.getTracking = async (req, res) => {
 
 function tokenMatches(provided, expected) {
   if (!provided || !expected) return false;
-  const a = Buffer.from(String(provided));
-  const b = Buffer.from(String(expected));
+  // Trim: tokens pasted into the Shiprocket panel / .env often carry stray whitespace.
+  const a = Buffer.from(String(provided).trim());
+  const b = Buffer.from(String(expected).trim());
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
@@ -302,7 +303,15 @@ exports.webhook = async (req, res) => {
     return res.status(503).json({ success: false, error: 'Webhook not configured' });
   }
   if (!tokenMatches(req.headers['x-api-key'], expected)) {
-    log.warn('shipping.webhook_bad_token', { requestId: req.id });
+    // Never log the token itself — only enough to tell "missing" from "wrong".
+    const got = String(req.headers['x-api-key'] || '').trim();
+    log.warn('shipping.webhook_bad_token', {
+      requestId: req.id,
+      headerPresent: !!got,
+      receivedLength: got.length,
+      expectedLength: String(expected).trim().length,
+      contentType: req.headers['content-type'] || null,
+    });
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
 

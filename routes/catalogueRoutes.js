@@ -4,6 +4,7 @@ const express = require('express');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const router = express.Router();
 const ctrl = require('../controllers/catalogueController');
+const cert = require('../controllers/certificateController');
 const verifyToken = require('../middlewares/verifyToken');
 const isAdmin = require('../middlewares/isAdmin');
 const { validate } = require('../middlewares/validate');
@@ -32,6 +33,16 @@ router.post('/leads', leadLimiter, validate({
 }), ctrl.submitLead);
 router.get('/file', ctrl.downloadFile);
 
+// Public — FSSAI certificate (same lead gate as the catalogue).
+router.get('/fssai', cert.getInfo);
+router.post('/fssai/leads', leadLimiter, validate({
+  body: {
+    name: { type: 'string', trim: true, max: 60, required: true },
+    mobile: { type: 'string', trim: true, max: 20, required: true },
+  },
+}), cert.submitLead);
+router.get('/fssai/file', cert.downloadFile);
+
 // Admin.
 router.get('/admin', verifyToken, isAdmin, ctrl.getAdminCatalogue);
 router.patch('/admin', verifyToken, isAdmin, writeLimiter, validate({
@@ -43,6 +54,17 @@ router.patch('/admin', verifyToken, isAdmin, writeLimiter, validate({
 }), ctrl.updateDetails);
 router.put('/admin/file', verifyToken, isAdmin, writeLimiter, rawPdf, ctrl.uploadFile);
 router.delete('/admin/file', verifyToken, isAdmin, writeLimiter, ctrl.deleteFile);
+router.get('/admin/fssai', verifyToken, isAdmin, cert.getAdmin);
+router.patch('/admin/fssai', verifyToken, isAdmin, writeLimiter, validate({
+  body: {
+    enabled: { type: 'boolean' },
+    title: { type: 'string', trim: true, max: 100 },
+    registrationNo: { type: 'string', trim: true, max: 20 },
+    validUpto: { type: 'string', trim: true, max: 10 },
+  },
+}), cert.updateDetails);
+router.put('/admin/fssai/file', verifyToken, isAdmin, writeLimiter, rawPdf, cert.uploadFile);
+router.delete('/admin/fssai/file', verifyToken, isAdmin, writeLimiter, cert.deleteFile);
 router.get('/admin/leads', verifyToken, isAdmin, ctrl.listLeads);
 router.delete('/admin/leads/:id', verifyToken, isAdmin, writeLimiter, ctrl.deleteLead);
 

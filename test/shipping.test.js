@@ -112,6 +112,35 @@ test('fastest is only offered where an express (non-surface) courier serves the 
   assert.equal(withAir.fastest.eta, '2–3 business days');
 });
 
+test('actual-cost mode charges the cheapest courier (+ markup) and returns it as the quoted courier', async () => {
+  db.seed('deliverySettings/global', {
+    freeDeliveryEnabled: false, serviceByDefault: true, courierLinkedFee: true,
+    courierFeeMode: 'actual', courierFeeMarkupPct: 10,
+    fastestDeliveryEnabled: true, defaultFastestDeliveryFee: 120,
+  });
+  // Shiprocket recommends C1 (₹80) but C2 is cheaper (₹62.5).
+  stub({ checkServiceability: quotes([courier(1, { rate: 80 }), courier(2, { rate: 62.5 }), courier(3, { surface: false, days: 1, rate: 150 })], 1) });
+  const std = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300 });
+  assert.equal(std.fee, 69); // ceil(62.5 × 1.10)
+  assert.equal(std.estimatedShippingCost, 62.5);
+  assert.deepEqual(std.quotedCourier, { courierId: 2, name: 'C2', rate: 62.5 });
+
+  const fast = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300, method: 'fastest' });
+  assert.equal(fast.fee, 165); // express ₹150 + 10%
+  assert.equal(fast.quotedCourier.courierId, 3);
+});
+
+test('free delivery still wins over actual-cost mode', async () => {
+  db.seed('deliverySettings/global', {
+    freeDeliveryEnabled: true, freeDeliveryThreshold: 500, serviceByDefault: true,
+    courierLinkedFee: true, courierFeeMode: 'actual',
+  });
+  stub({ checkServiceability: quotes([courier(1, { rate: 70 })]) });
+  const r = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 900 });
+  assert.equal(r.fee, 0);
+  assert.equal(r.estimatedShippingCost, 70);
+});
+
 // ── fulfilment ──────────────────────────────────────────────────────────────
 
 test('local-partner orders are not pushed automatically, but staff can force it', async () => {
@@ -141,6 +170,48 @@ test('a fastest order is shipped with the express courier and its freight record
   assert.equal(assignedTo, 2);
   assert.equal(shipment.courierPick, 'express');
   assert.equal(shipment.freightEstimate, 140);
+});
+
+test('a standard order is shipped with the cheapest courier, not Shiprocket\'s recommendation', async () => {
+  db.seed('orders/o3', paidOrder({ shipment: { provider: 'shiprocket', state: 'created', srOrderId: 8, shipmentId: 80 } }));
+  let assignedTo;
+  stub({
+    checkServiceability: quotes([courier(1, { rate: 90 }), courier(2, { rate: 58 }), courier(3, { rate: 75 })], 1),
+    assignAwb: async (_id, cid) => { assignedTo = cid; return { awb: 'AWB3', courierId: cid, courierName: `C${cid}` }; },
+    generatePickup: async () => ({ scheduledDate: '2026-11-05' }),
+    generateLabel: async () => 'https://label',
+  });
+  const { shipment } = await shipping.shipOrder('o3');
+  assert.equal(assignedTo, 2);
+  assert.equal(shipment.courierPick, 'cheapest');
+  assert.equal(shipment.freightEstimate, 58);
+});
+
+test('the shipment reuses the box planned at checkout unless staff pick another', async () => {
+  const plannedPackage = { boxId: 'BX-L', boxName: 'Large', length: 30, breadth: 22, height: 14, weightKg: 0.75, chargeableKg: 0.92 };
+  db.seed('orders/o4', paidOrder({ plannedPackage }));
+  db.seed('orders/o5', paidOrder({ plannedPackage }));
+  const sent = [];
+  stub({ createOrder: async (_id, _o, pkg) => { sent.push(pkg); return { srOrderId: 1, shipmentId: 2, srStatus: 'NEW', weightKg: pkg.weightKg }; } });
+
+  const auto = await shipping.createShipmentForOrder('o4');
+  assert.equal(sent[0].boxId, 'BX-L'); // auto-fit alone would choose Small for one 500 g pouch
+  assert.equal(auto.package.source, 'checkout');
+
+  await shipping.createShipmentForOrder('o5', { packageOverride: { boxId: 'BX-M' } });
+  assert.equal(sent[1].boxId, 'BX-M');
+});
+
+test('bulk carts pick the big carton; carts too big for any box are flagged oversize', async () => {
+  const pkgSvc = require('../services/packageService');
+  const settings = pkgSvc.normaliseSettings({});
+  const bulk = pkgSvc.buildPackage([{ quantity: 20, shipWeightKg: 0.5 }], settings); // 10 kg
+  assert.equal(bulk.boxId, 'BX-C20');
+  assert.equal(bulk.oversize, false);
+  const huge = pkgSvc.buildPackage([{ quantity: 60, shipWeightKg: 0.5 }], settings); // 30 kg
+  assert.equal(huge.oversize, true);
+  // A staff-chosen box never counts as oversize (they decide at dispatch).
+  assert.equal(pkgSvc.buildPackage([{ quantity: 60, shipWeightKg: 0.5 }], settings, { boxId: 'BX-C20' }).oversize, false);
 });
 
 test('NDR flags the shipment once; RTO halts forward moves and alerts staff', async () => {

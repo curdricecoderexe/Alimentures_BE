@@ -81,6 +81,13 @@ if (srSet.length === 0) {
 
 /* nice to have */
 if (!has('ERROR_WEBHOOK_URL')) add('WARN', 'ERROR_WEBHOOK_URL', 'missing — production errors will not alert you');
+if (!has('ORDER_ALERT_EMAILS')) add('WARN', 'ORDER_ALERT_EMAILS', 'missing — the team will not be emailed new orders');
+if (has('WHATSAPP_TOKEN') !== has('WHATSAPP_PHONE_NUMBER_ID')) {
+  add('FAIL', 'WHATSAPP_*', 'set BOTH WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID (or neither) — WhatsApp alerts are off');
+} else if (has('WHATSAPP_TOKEN')) {
+  if (!has('WHATSAPP_ADMIN_NUMBERS') && has('WHATSAPP_TEMPLATE_ADMIN_ORDER')) add('WARN', 'WHATSAPP_ADMIN_NUMBERS', 'missing — no team number gets new-order WhatsApps');
+  else add('OK', 'WHATSAPP_*', 'configured — templates must be APPROVED in WhatsApp Manager');
+}
 const smtp = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS'].filter((k) => !has(k));
 if (smtp.length) add(prod ? 'FAIL' : 'WARN', 'SMTP_*', `missing ${smtp.join(', ')} — OTP / order emails will not be sent`);
 
