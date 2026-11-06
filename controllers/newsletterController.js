@@ -21,6 +21,7 @@ const { createAuditLog } = require('../services/auditService');
 
 const COLLECTION = 'newsletterSubscribers';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const WELCOME_RESEND_MS = 10 * 60 * 1000;
 
 // Signing key for unsubscribe links: explicit env var, else derived from the
 // service-account key (stable across restarts, never exposed).
@@ -90,7 +91,15 @@ exports.subscribe = async (req, res) => {
     }
     const ref = db.collection(COLLECTION).doc(docId(email));
     const snap = await ref.get();
-    const wasActive = snap.exists && snap.data().status === 'subscribed';
+    const prev = snap.exists ? snap.data() : {};
+    const wasActive = prev.status === 'subscribed';
+    // Already subscribed: re-send the welcome (the visitor expects an email every
+    // time they submit) — at most once per WELCOME_RESEND_MS per address, so the
+    // form can't be used to flood someone's inbox.
+    const lastWelcome = prev.welcomeSentAt?.toMillis?.() || 0;
+    if (wasActive && Date.now() - lastWelcome >= WELCOME_RESEND_MS) {
+      sendWelcome(req, ref, email).catch((err) => log.error('newsletter.welcome_failed', { err }));
+    }
 
     if (!wasActive) {
       await ref.set({

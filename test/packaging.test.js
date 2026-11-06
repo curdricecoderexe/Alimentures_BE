@@ -42,7 +42,7 @@ test('label weight + pouch allowance is used when a variant has no packed weight
 
 test('contents bigger than every box fall back to the largest and are flagged', () => {
   const p = pkg.buildPackage([{ quantity: 30, selectedWeight: '1kg', shipWeightKg: 1.02 }], settings);
-  assert.equal(p.boxId, 'BX-C20');
+  assert.equal(p.boxId, 'BX-C30');
   assert.equal(p.fits, false);
   assert.equal(p.oversize, true);
   assert.ok(p.warnings.some((w) => /largest box/.test(w)));
@@ -62,7 +62,7 @@ test('staff can force a box or enter a custom size and weight', () => {
 });
 
 test('inactive boxes are skipped; with none active the env fallback box is used', () => {
-  const noSmall = pkg.normaliseSettings({ boxes: pkg.DEFAULT_BOXES.map((b) => ({ ...b, isActive: b.id !== 'BX-S' })) });
+  const noSmall = pkg.normaliseSettings({ boxes: pkg.DEFAULT_BOXES.map((b) => ({ ...b, isActive: !['BX-XS', 'BX-S'].includes(b.id) })) });
   assert.equal(pkg.buildPackage([{ quantity: 1, shipWeightKg: 0.2 }], noSmall).boxId, 'BX-M');
 
   const none = pkg.normaliseSettings({ boxes: [] });

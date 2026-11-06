@@ -224,12 +224,12 @@ async function deliveryAnswer(pincode) {
     const place = [o.city, o.state].filter(Boolean).join(', ');
     const fast = o.fastest?.available ? `\nFastest delivery: ${o.fastest.fee ? money(o.fastest.fee) : 'free'}, ${o.fastest.eta}.` : '';
     return {
-      reply: `Yes, we deliver to ${pincode}${place ? ` (${place})` : ''}.\nStandard delivery: ${o.standard.fee ? money(o.standard.fee) : 'free'}, ${o.standard.eta}.${fast}${free}`,
+      reply: `Yes, we deliver to ${pincode}${place ? ` (${place})` : ''}.\nStandard delivery: from ${o.standard.fee ? money(o.standard.fee) : 'free'} for a small parcel, ${o.standard.eta}. The exact fee depends on your cart's weight and is shown at checkout.${fast}${free}`,
       suggestions: ['What products do you have?', 'Payment options'],
     };
   }
   return {
-    reply: `Standard delivery is ${money(s.defaultDeliveryFee)} and usually takes ${s.defaultStandardEta}.${free} We dispatch from Chennai within 1–2 working days through Shiprocket's courier partners, and you get a tracking (AWB) number once shipped.\n\nSend me your 6-digit PIN code and I'll check delivery to you.`,
+    reply: `Delivery is charged at our courier partner's rate for your parcel's weight and PIN code (from ${money(s.courierFeeBands?.[0]?.fee ?? s.defaultDeliveryFee)}), shown at checkout before you pay. It usually takes ${s.defaultStandardEta}.${free} We dispatch from Chennai within 1–2 working days through Shiprocket's courier partners, and you get a tracking (AWB) number once shipped.\n\nSend me your 6-digit PIN code and I'll check delivery to you.`,
     links: [{ label: 'Shipping Policy', url: `${SITE}/policies/shipping-policy` }],
   };
 }

@@ -234,6 +234,45 @@ async function runShipmentRetry() {
 }
 exports.runShipmentRetry = runShipmentRetry;
 
+/** Order statuses whose parcel is with (or about to reach) the courier. */
+const TRACKABLE_STATUSES = ['packed', 'shipped', 'out_for_delivery'];
+const TRACKING_HALTED = ['rto_in_transit', 'rto_delivered', 'lost', 'cancelled', 'delivered'];
+const TRACKING_SYNC_MAX = 100; // per run — keeps Shiprocket API use bounded
+
+/**
+ * Safety net for customer status updates: pull Shiprocket tracking for every
+ * in-flight shipment and notify the customer (email + WhatsApp + in-app) on
+ * each change. The webhook is the fast path; this catches anything it missed
+ * (webhook not configured, delivery failure, downtime). Shared by the
+ * in-process scheduler. Never throws.
+ */
+async function runTrackingSync() {
+  if (!shiprocket.isEnabled()) return { checked: 0, changed: 0 };
+  const snap = await db.collection('orders').where('status', 'in', TRACKABLE_STATUSES).limit(500).get();
+  const due = snap.docs
+    .filter((d) => {
+      const sh = d.data().shipment || {};
+      if (!sh.awb || TRACKING_HALTED.includes(sh.state)) return false;
+      const t = sh.lastSyncedAt;
+      const last = t?.toMillis?.() ?? (t instanceof Date ? t.getTime() : 0);
+      return Date.now() - last >= TRACKING_STALE_MS; // the webhook updated it recently
+    })
+    .slice(0, TRACKING_SYNC_MAX);
+
+  let changed = 0;
+  for (const d of due) {
+    try {
+      const change = await shipping.refreshTracking(d.id);
+      if (change) { changed += 1; notifyStatusChange(d.id, change); }
+    } catch (err) {
+      log.warn('shipping.tracking_sync_order_failed', { orderId: d.id, err });
+    }
+  }
+  if (due.length) log.info('shipping.tracking_sync_run', { checked: due.length, changed });
+  return { checked: due.length, changed };
+}
+exports.runTrackingSync = runTrackingSync;
+
 /** POST /api/shipping/orders/:id/sync — pull latest tracking now (staff) */
 exports.syncTracking = async (req, res) => {
   try {

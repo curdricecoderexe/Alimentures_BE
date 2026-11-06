@@ -62,7 +62,7 @@ test('bot policy answers win over delivery / order routing', async () => {
 });
 
 test('bot uses live delivery settings and asks guests to sign in for orders', async () => {
-  assert.match((await ask('delivery charges')).reply, /₹70.*free on orders above ₹500/s);
+  assert.match((await ask('delivery charges')).reply, /courier partner's rate.*from ₹\d+/s);
   const order = await ask('where is my order');
   assert.match(order.reply, /sign in/i);
 });

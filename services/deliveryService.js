@@ -26,7 +26,7 @@ const log = require('../lib/logger');
 const shiprocket = require('./shiprocketService');
 const {
   DEFAULT_SETTINGS, SETTINGS_COLLECTION, SETTINGS_DOC, PINCODE_COLLECTION,
-  PINCODE_RE, FEE_MIN, FEE_MAX, DELIVERY_PARTNERS, COURIER_FEE_MODES,
+  PINCODE_RE, FEE_MIN, FEE_MAX, DELIVERY_PARTNERS, MAX_FEE_BANDS,
 } = require('../config/deliveryConstants');
 
 /* ── global settings (short-lived in-process cache) ─────────────────────── */
@@ -59,11 +59,11 @@ function toBool(v, fallback) {
 
 /**
  * Fee bands keyed on the courier's freight quote: [{ maxRate, fee }], sorted
- * ascending with maxRate 0 ("and above") last. At most 10 bands.
+ * ascending with maxRate 0 ("and above") last. At most MAX_FEE_BANDS bands.
  */
 function normaliseFeeBands(raw, fallback) {
   if (!Array.isArray(raw)) return fallback.map((b) => ({ ...b }));
-  const bands = raw.slice(0, 10)
+  const bands = raw.slice(0, MAX_FEE_BANDS)
     .map((b) => ({ maxRate: clampFee(b?.maxRate, 0), fee: clampFee(b?.fee, NaN) }))
     .filter((b) => Number.isFinite(b.fee));
   bands.sort((a, b) => (a.maxRate || Infinity) - (b.maxRate || Infinity));
@@ -71,21 +71,23 @@ function normaliseFeeBands(raw, fallback) {
 }
 
 /** Customer fee for a courier freight quote, or null when no band matches. */
+/**
+ * Band fee for a freight quote. The customer always pays the delivery cost in
+ * full: the result is never below the quote itself (rounded up to the rupee),
+ * even if a band is set too low or the quote is above every band.
+ */
 function feeForCourierRate(rate, bands) {
   if (!(rate > 0) || !Array.isArray(bands)) return null;
   const band = bands.find((b) => !b.maxRate || rate <= b.maxRate);
-  return band ? band.fee : null;
+  return clampFee(Math.max(band ? band.fee : 0, Math.ceil(rate)), null);
 }
 
 /**
- * Customer fee from a courier freight quote under the admin's courier-fee mode,
- * or null (→ caller falls back) when not courier-linked or there's no quote.
+ * Customer fee from a courier freight quote (bands), or null (→ caller falls
+ * back) when there's no quote. Courier-linked 'bands' pricing is always on.
  */
 function courierLinkedFeeFor(rate, settings) {
-  if (!settings.courierLinkedFee || !(rate > 0)) return null;
-  if (settings.courierFeeMode === 'actual') {
-    return clampFee(Math.ceil(rate * (1 + settings.courierFeeMarkupPct / 100)), null);
-  }
+  if (!(rate > 0)) return null;
   return feeForCourierRate(rate, settings.courierFeeBands);
 }
 
@@ -111,7 +113,8 @@ function normaliseSettings(raw = {}) {
   return {
     defaultDeliveryFee: clampFee(raw.defaultDeliveryFee, d.defaultDeliveryFee),
     defaultStandardEta: String(raw.defaultStandardEta || d.defaultStandardEta).slice(0, 60),
-    freeDeliveryEnabled: toBool(raw.freeDeliveryEnabled, d.freeDeliveryEnabled),
+    // POLICY: delivery is always collected from the customer — no free delivery.
+    freeDeliveryEnabled: false,
     freeDeliveryThreshold: clampFee(raw.freeDeliveryThreshold, d.freeDeliveryThreshold),
     fastestDeliveryEnabled: toBool(raw.fastestDeliveryEnabled, d.fastestDeliveryEnabled),
     defaultFastestDeliveryFee: clampFee(raw.defaultFastestDeliveryFee, d.defaultFastestDeliveryFee),
@@ -120,8 +123,9 @@ function normaliseSettings(raw = {}) {
     fastestMinOrderValue: clampFee(raw.fastestMinOrderValue, d.fastestMinOrderValue),
     fastestMaxOrderValue: clampFee(raw.fastestMaxOrderValue, d.fastestMaxOrderValue),
     serviceByDefault: toBool(raw.serviceByDefault, d.serviceByDefault),
-    courierLinkedFee: toBool(raw.courierLinkedFee, d.courierLinkedFee),
-    courierFeeMode: COURIER_FEE_MODES.includes(raw.courierFeeMode) ? raw.courierFeeMode : d.courierFeeMode,
+    // POLICY: the fee always follows the courier quote via bands.
+    courierLinkedFee: true,
+    courierFeeMode: 'bands',
     courierFeeMarkupPct: Math.min(100, Math.max(0, Number.isFinite(Number(raw.courierFeeMarkupPct)) && raw.courierFeeMarkupPct !== ''
       ? Number(raw.courierFeeMarkupPct) : d.courierFeeMarkupPct)),
     courierFeeBands: normaliseFeeBands(raw.courierFeeBands, d.courierFeeBands),
@@ -294,20 +298,25 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0, weightKg } = {}) 
   }
 
   // ── standard ──
+  // Shiprocket PINs: the band for the live freight quote ALWAYS decides the fee
+  // (custom PIN fees can't undercut the courier cost). Without a quote
+  // (Shiprocket down) → per-0.5 kg fallback, so heavy carts still pay their way.
+  // Local-partner PINs: custom PIN fee, else the flat default fee.
   out.standard.available = true;
-  if (rule && standardFeeTypeOf(rule) === 'custom') {
+  const bandFee = out.partner === 'shiprocket' ? courierLinkedFeeFor(courier?.rate, settings) : null;
+  if (bandFee != null) {
+    out.standard.fee = bandFee;
+  } else if (rule && standardFeeTypeOf(rule) === 'custom') {
     out.standard.fee = clampFee(rule.standardDeliveryFee, settings.defaultDeliveryFee);
+  } else if (out.partner === 'shiprocket') {
+    out.standard.fee = clampFee(settings.defaultDeliveryFee * (weightSlab(weightKg) / 0.5), settings.defaultDeliveryFee);
   } else {
-    out.standard.fee = courierLinkedFeeFor(courier?.rate, settings) ?? settings.defaultDeliveryFee;
+    out.standard.fee = settings.defaultDeliveryFee;
   }
   if (rule?.standardDeliveryEta) out.standard.eta = String(rule.standardDeliveryEta).slice(0, 60);
   else if (courier?.eta) out.standard.eta = courier.eta;
 
-  // ── free-delivery override (standard only) ──
-  if (settings.freeDeliveryEnabled && sub >= settings.freeDeliveryThreshold && sub > 0) {
-    out.standard.fee = 0;
-    out.freeDeliveryApplied = true;
-  }
+  // (Free delivery is switched off by policy — the customer always pays.)
 
   // ── fastest ──
   const fastestGloballyOn = !!settings.fastestDeliveryEnabled;
@@ -331,9 +340,8 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0, weightKg } = {}) 
     } else if (courier?.express?.eta && !(rule && rule.fastestDeliveryEta)) {
       eta = courier.express.eta;
     }
-    // 'actual' mode charges the express courier's real cost unless the PIN has its own fastest fee.
-    const pinFastestFee = rule && rule.fastestDeliveryFee != null;
-    if (courier?.express && !pinFastestFee && settings.courierFeeMode === 'actual') {
+    // Fastest is priced from the express courier's real quote via the same bands.
+    if (courier?.express) {
       fee = courierLinkedFeeFor(courier.express.rate, settings) ?? fee;
     }
     if (available && settings.fastestMinOrderValue > 0 && sub > 0 && sub < settings.fastestMinOrderValue) {
