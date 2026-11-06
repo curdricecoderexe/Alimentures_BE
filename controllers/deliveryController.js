@@ -25,6 +25,8 @@ exports.getDeliverySummary = async (req, res) => {
         freeDeliveryEnabled: s.freeDeliveryEnabled,
         freeDeliveryThreshold: s.freeDeliveryThreshold,
         defaultDeliveryFee: s.defaultDeliveryFee,
+        // Lowest fee a courier-linked band can charge — for "delivery from ₹X" copy.
+        minDeliveryFee: s.courierFeeBands?.[0]?.fee ?? s.defaultDeliveryFee,
         standardEta: s.defaultStandardEta,
       },
     });

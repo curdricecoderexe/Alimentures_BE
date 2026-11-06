@@ -32,15 +32,31 @@ const LIMITS = Object.freeze({
   MAX_BOXES: 20,
 });
 
-/** Starter catalogue — common e-commerce corrugated boxes; admin edits these. */
+/**
+ * Starter catalogue — single item up to bulk, smallest first; admin edits these.
+ * The smallest box the cart fits is picked, so a small order is never billed
+ * for a big box's volumetric weight (L×B×H/5000). maxWeightKg includes the box.
+ *   box      size (cm)   volumetric   typical contents
+ *   XS       12×10×6     0.14 kg      one 100–250 g pouch / jar
+ *   S        15×12×8     0.29 kg      1–2 small packs (≤ 0.5 kg)
+ *   M        22×16×10    0.70 kg      2–3 packs (≤ 1.5 kg)
+ *   L        30×22×14    1.85 kg      4–6 packs (≤ 3.5 kg)
+ *   XL       36×28×18    3.63 kg      family order (≤ 7 kg)
+ *   XXL      40×30×25    6.00 kg      large order (≤ 12 kg)
+ *   C20      45×35×30    9.45 kg      bulk (≤ 20 kg)
+ *   C30      55×40×35    15.4 kg      bulk (≤ 30 kg)
+ */
 const DEFAULT_BOXES = Object.freeze([
+  { id: 'BX-XS', name: 'Extra small', length: 12, breadth: 10, height: 6, boxWeightKg: 0.04, maxWeightKg: 0.35, isActive: true },
   { id: 'BX-S', name: 'Small', length: 15, breadth: 12, height: 8, boxWeightKg: 0.06, maxWeightKg: 0.6, isActive: true },
   { id: 'BX-M', name: 'Medium', length: 22, breadth: 16, height: 10, boxWeightKg: 0.11, maxWeightKg: 1.5, isActive: true },
   { id: 'BX-L', name: 'Large', length: 30, breadth: 22, height: 14, boxWeightKg: 0.18, maxWeightKg: 3.5, isActive: true },
   { id: 'BX-XL', name: 'Extra large', length: 36, breadth: 28, height: 18, boxWeightKg: 0.26, maxWeightKg: 7, isActive: true },
+  { id: 'BX-XXL', name: 'Double extra large', length: 40, breadth: 30, height: 25, boxWeightKg: 0.4, maxWeightKg: 12, isActive: true },
   // Bulk orders ship as ONE big carton. Orders that don't fit the largest active
   // box are refused at checkout (see OVERSIZE_MESSAGE) — add bigger cartons here.
   { id: 'BX-C20', name: 'Bulk carton', length: 45, breadth: 35, height: 30, boxWeightKg: 0.6, maxWeightKg: 20, isActive: true },
+  { id: 'BX-C30', name: 'Bulk carton large', length: 55, breadth: 40, height: 35, boxWeightKg: 0.8, maxWeightKg: 30, isActive: true },
 ]);
 
 const OVERSIZE_MESSAGE = 'This order is too large to ship as one parcel. Please reduce the quantity or contact us for a bulk order quote.';

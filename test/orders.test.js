@@ -72,10 +72,11 @@ test('createOrder snapshots packed weight + size onto order items for the parcel
   assert.ok(!('shipWeightKg' in ghee) && !('dims' in ghee), 'no shipping data → no fields');
 });
 
-test('createOrder applies free delivery above the threshold', async () => {
+test('createOrder always charges delivery — even above the old free-delivery threshold', async () => {
   const res = await placeOrder({ items: [{ productId: 'ghee', selectedWeight: '500ml', quantity: 2 }] });
   assert.equal(res.statusCode, 201);
-  assert.equal(db.read(`orders/${res.body.orderId}`).totalAmount, 900);
+  // No Shiprocket in tests → fallback ₹70 per 0.5 kg slab: 2 × 500 ml (+5%) in a Medium box ≈ 1.18 kg → 1.5 kg → ₹210.
+  assert.equal(db.read(`orders/${res.body.orderId}`).totalAmount, 900 + 210);
 });
 
 test('createOrder rejects empty carts, bad quantities and unavailable products', async () => {

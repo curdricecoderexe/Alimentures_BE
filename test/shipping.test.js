@@ -8,7 +8,7 @@
 
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { db } = require('./helpers/setup');
+const { db, mailsSent } = require('./helpers/setup');
 const shiprocket = require('../services/shiprocketService');
 const shipping = require('../services/shippingService');
 const delivery = require('../services/deliveryService');
@@ -80,23 +80,50 @@ test('courier check uses the cart weight slab', async () => {
   assert.equal(asked.weightKg, 2.5);
 });
 
-test('courier-linked fees pick the band for the freight quote; custom PIN fees still win', async () => {
+test('bands always price Shiprocket PINs; custom PIN fees cannot undercut the courier', async () => {
   db.seed('deliverySettings/global', {
-    defaultDeliveryFee: 50, freeDeliveryEnabled: false, serviceByDefault: true, courierLinkedFee: true,
-    courierFeeBands: [{ maxRate: 50, fee: 40 }, { maxRate: 100, fee: 70 }, { maxRate: 0, fee: 150 }],
+    defaultDeliveryFee: 50, serviceByDefault: true,
+    courierFeeBands: [{ maxRate: 50, fee: 40 }, { maxRate: 100, fee: 100 }, { maxRate: 0, fee: 150 }],
   });
   stub({ checkServiceability: quotes([courier(1, { rate: 85 })]) });
   const banded = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100 });
-  assert.equal(banded.fee, 70);
+  assert.equal(banded.fee, 100);
   assert.equal(banded.estimatedShippingCost, 85);
 
+  // Above every band's fee → never less than the quote itself.
   pin += 1;
-  stub({ checkServiceability: quotes([courier(1, { rate: 400 })]) });
-  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100 })).fee, 150);
+  stub({ checkServiceability: quotes([courier(1, { rate: 400.2 })]) });
+  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100 })).fee, 401);
 
   pin += 1;
+  stub({ checkServiceability: quotes([courier(1, { rate: 85 })]) });
   db.seed(`deliveryPincodes/${pin}`, { pincode: String(pin), deliveryAvailable: true, standardFeeType: 'custom', standardDeliveryFee: 25 });
-  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100 })).fee, 25);
+  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100 })).fee, 100);
+});
+
+test('saved free-delivery / actual-mode / courier-link-off settings are overridden by policy', async () => {
+  db.seed('deliverySettings/global', {
+    freeDeliveryEnabled: true, freeDeliveryThreshold: 500, serviceByDefault: true,
+    courierLinkedFee: false, courierFeeMode: 'actual', courierFeeMarkupPct: 10,
+  });
+  const s = await delivery.getGlobalSettings({ fresh: true });
+  assert.equal(s.freeDeliveryEnabled, false);
+  assert.equal(s.courierLinkedFee, true);
+  assert.equal(s.courierFeeMode, 'bands');
+  stub({ checkServiceability: quotes([courier(1, { rate: 132.72 })]) });
+  const r = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 900 });
+  assert.equal(r.fee, 140); // default bands: ≤ ₹140 → ₹140, no free delivery at ₹900
+  assert.equal(r.freeDeliveryApplied, false);
+});
+
+test('Shiprocket outage falls back to the default fee per 0.5 kg slab; local PINs pay it flat', async () => {
+  db.seed('deliverySettings/global', { defaultDeliveryFee: 70, serviceByDefault: true });
+  stub({ checkServiceability: async () => { throw new Error('down'); } });
+  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100, weightKg: 1.8 })).fee, 280); // 2 kg = 4 slabs
+
+  pin += 1;
+  db.seed(`deliveryPincodes/${pin}`, { pincode: String(pin), deliveryAvailable: true, deliveryPartner: 'local' });
+  assert.equal((await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 100, weightKg: 1.8 })).fee, 70);
 });
 
 test('fastest is only offered where an express (non-surface) courier serves the PIN', async () => {
@@ -112,33 +139,18 @@ test('fastest is only offered where an express (non-surface) courier serves the 
   assert.equal(withAir.fastest.eta, '2–3 business days');
 });
 
-test('actual-cost mode charges the cheapest courier (+ markup) and returns it as the quoted courier', async () => {
-  db.seed('deliverySettings/global', {
-    freeDeliveryEnabled: false, serviceByDefault: true, courierLinkedFee: true,
-    courierFeeMode: 'actual', courierFeeMarkupPct: 10,
-    fastestDeliveryEnabled: true, defaultFastestDeliveryFee: 120,
-  });
+test('the cheapest courier is quoted; fastest is priced from the express courier via the bands', async () => {
+  db.seed('deliverySettings/global', { serviceByDefault: true, fastestDeliveryEnabled: true, defaultFastestDeliveryFee: 120 });
   // Shiprocket recommends C1 (₹80) but C2 is cheaper (₹62.5).
   stub({ checkServiceability: quotes([courier(1, { rate: 80 }), courier(2, { rate: 62.5 }), courier(3, { surface: false, days: 1, rate: 150 })], 1) });
   const std = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300 });
-  assert.equal(std.fee, 69); // ceil(62.5 × 1.10)
+  assert.equal(std.fee, 80); // default bands: ≤ ₹80 → ₹80
   assert.equal(std.estimatedShippingCost, 62.5);
   assert.deepEqual(std.quotedCourier, { courierId: 2, name: 'C2', rate: 62.5 });
 
   const fast = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300, method: 'fastest' });
-  assert.equal(fast.fee, 165); // express ₹150 + 10%
+  assert.equal(fast.fee, 170); // express ₹150 → band ≤ ₹170
   assert.equal(fast.quotedCourier.courierId, 3);
-});
-
-test('free delivery still wins over actual-cost mode', async () => {
-  db.seed('deliverySettings/global', {
-    freeDeliveryEnabled: true, freeDeliveryThreshold: 500, serviceByDefault: true,
-    courierLinkedFee: true, courierFeeMode: 'actual',
-  });
-  stub({ checkServiceability: quotes([courier(1, { rate: 70 })]) });
-  const r = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 900 });
-  assert.equal(r.fee, 0);
-  assert.equal(r.estimatedShippingCost, 70);
 });
 
 // ── fulfilment ──────────────────────────────────────────────────────────────
@@ -205,9 +217,12 @@ test('the shipment reuses the box planned at checkout unless staff pick another'
 test('bulk carts pick the big carton; carts too big for any box are flagged oversize', async () => {
   const pkgSvc = require('../services/packageService');
   const settings = pkgSvc.normaliseSettings({});
-  const bulk = pkgSvc.buildPackage([{ quantity: 20, shipWeightKg: 0.5 }], settings); // 10 kg
+  assert.equal(pkgSvc.buildPackage([{ quantity: 1, shipWeightKg: 0.25 }], settings).boxId, 'BX-XS'); // one small pouch
+  assert.equal(pkgSvc.buildPackage([{ quantity: 20, shipWeightKg: 0.5 }], settings).boxId, 'BX-XXL'); // 10 kg
+  const bulk = pkgSvc.buildPackage([{ quantity: 30, shipWeightKg: 0.5 }], settings); // 15 kg
   assert.equal(bulk.boxId, 'BX-C20');
   assert.equal(bulk.oversize, false);
+  assert.equal(pkgSvc.buildPackage([{ quantity: 50, shipWeightKg: 0.5 }], settings).boxId, 'BX-C30'); // 25 kg
   const huge = pkgSvc.buildPackage([{ quantity: 60, shipWeightKg: 0.5 }], settings); // 30 kg
   assert.equal(huge.oversize, true);
   // A staff-chosen box never counts as oversize (they decide at dispatch).
@@ -395,4 +410,22 @@ test('admin test-login clears the pause, recovers, and is rate-limited', async (
     net.restore();
     shiprocket._resetAuthForTests();
   }
+});
+
+test('tracking sync pulls stale in-flight shipments and emails the customer on a change', async () => {
+  const { runTrackingSync } = require('../controllers/shippingController');
+  const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+  db.seed('orders/t1', paidOrder({ status: 'packed', shipment: { provider: 'shiprocket', state: 'pickup_scheduled', awb: 'T1', lastSyncedAt: old } }));
+  db.seed('orders/t2', paidOrder({ status: 'packed', shipment: { provider: 'shiprocket', state: 'pickup_scheduled' } })); // no AWB yet
+  db.seed('orders/t3', paidOrder({ status: 'shipped', shipment: { provider: 'shiprocket', state: 'in_transit', awb: 'T3', lastSyncedAt: new Date() } })); // fresh
+  const asked = [];
+  stub({ trackAwb: async (awb) => { asked.push(awb); return { status: 'IN TRANSIT', etd: null, trackUrl: null, activities: [] }; } });
+  const before = mailsSent.length;
+
+  const r = await runTrackingSync();
+  assert.deepEqual(asked, ['T1']);
+  assert.deepEqual(r, { checked: 1, changed: 1 });
+  assert.equal(db.read('orders/t1').status, 'shipped');
+  await new Promise((done) => setImmediate(done));
+  assert.ok(mailsSent.slice(before).some((m) => m.to === 'a@x.in'), 'customer emailed');
 });

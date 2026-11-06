@@ -327,6 +327,15 @@ function startScheduledJobs() {
   setTimeout(retry, 60 * 1000).unref();
   setInterval(retry, retryEvery).unref();
   log.info('cron.shipment_retry_scheduled', { everyMs: retryEvery });
+
+  // Courier tracking safety net: keeps customers' order status (email / WhatsApp /
+  // in-app) moving even if a Shiprocket webhook is missed.
+  const { runTrackingSync } = require('./controllers/shippingController');
+  const syncEvery = Number(process.env.TRACKING_SYNC_INTERVAL_MS) || 60 * 60 * 1000;
+  const sync = () => runTrackingSync().catch((err) => log.error('cron.tracking_sync_failed', { err }));
+  setTimeout(sync, 2 * 60 * 1000).unref();
+  setInterval(sync, syncEvery).unref();
+  log.info('cron.tracking_sync_scheduled', { everyMs: syncEvery });
 }
 
 // Only bind a port when run directly (`node index.js`); stay importable for tests.
