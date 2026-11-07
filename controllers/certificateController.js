@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * FSSAI registration certificate — downloadable from the homepage, gated by
+ * FSSAI registration certificate — downloadable from the site footer, gated by
  * the same name + mobile lead form as the catalogue.
  *
  * The certificate PDF ships with the backend (assets/documents/), so it works
@@ -73,7 +73,7 @@ function publicInfo(m) {
 
 // ─── Public ──────────────────────────────────────────────────────────────────
 
-/** GET /api/catalogue/fssai — what the homepage card shows. */
+/** GET /api/catalogue/fssai — what the footer download shows. */
 exports.getInfo = async (req, res) => {
   try {
     const m = await readMeta();

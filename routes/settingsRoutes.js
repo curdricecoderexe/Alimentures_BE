@@ -10,5 +10,6 @@ router.get("/", settingsController.getSettings);
 
 // Admin only
 router.post("/", verifyToken, isAdmin, imageField(["newArrivalPoster"]), settingsController.updateSettings);
+router.put("/social", verifyToken, isAdmin, settingsController.updateSocialLinks);
 
 module.exports = router;
