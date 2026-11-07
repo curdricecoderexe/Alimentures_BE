@@ -3,7 +3,7 @@ const admin = require('../lib/firebaseAdmin');
 
 /**
  * Creates an audit log for sensitive admin operations
- * @param {Object} params
+ * @param {Object} para
  * @param {string} params.adminId - UID of the admin
  * @param {string} params.adminEmail - Email of the admin
  * @param {string} params.action - E.g. UPDATE_ORDER_STATUS, UPDATE_INVENTORY
