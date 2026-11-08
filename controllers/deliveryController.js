@@ -8,7 +8,7 @@ const log = require('../lib/logger');
 const locationService = require('../services/locationService');
 const { quotePackage, OVERSIZE_MESSAGE } = require('../services/packageService');
 const {
-  resolveDeliveryOptions, isValidPincode, normalisePincode, getPincodeRule, getGlobalSettings,
+  resolveDeliveryOptions, isValidPincode, normalisePincode, getPincodeRule, getGlobalSettings, partnerOf, courierRateFor,
 } = require('../services/deliveryService');
 
 /**
@@ -101,7 +101,7 @@ function parseCartQuery(raw) {
 
 /** Customer-safe copy of the resolver output (our freight cost stays private). */
 function publicOptions(opts) {
-  const { estimatedShippingCost, ...rest } = opts;
+  const { estimatedShippingCost, freightBufferPct, quoteMeta, ...rest } = opts;
   // Courier name + freight are internal too.
   const strip = (m) => { if (!m) return m; const { courier, ...pub } = m; return pub; };
   return { ...rest, standard: strip(rest.standard), fastest: strip(rest.fastest) };
@@ -119,8 +119,18 @@ exports.getDeliveryOptions = async (req, res) => {
       return res.status(400).json({ success: false, error: 'PIN code must be 6 digits' });
     }
     const subtotal = Math.max(0, Number(req.query.subtotal) || 0);
-    const pkg = await quotePackage(parseCartQuery(req.query.cart));
+    const partner = partnerOf(await getPincodeRule(pincode));
+    // Same packaging choice as order creation: ranked by real freight for courier PINs.
+    const pkg = await quotePackage(parseCartQuery(req.query.cart), {
+      rateLookup: partner === 'shiprocket' ? (kg) => courierRateFor(pincode, kg, 'standard') : undefined,
+    });
     const opts = await resolveDeliveryOptions({ pincode, subtotal, weightKg: pkg?.chargeableKg ?? null });
+    // Transparent, customer-safe parcel summary (no freight cost / margin).
+    opts.parcel = pkg ? {
+      billableKg: pkg.chargeableKg,
+      packageType: pkg.packageType,
+      estimated: pkg.confidence !== 'high',
+    } : null;
     if (pkg?.oversize && opts.partner !== 'local') {
       // Shiprocket PIN + bulk cart bigger than the largest box: no fee can be quoted — block before payment.
       opts.deliveryAvailable = false;

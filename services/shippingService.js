@@ -8,6 +8,18 @@
  *   3. applyTrackingUpdate()     — webhook / manual sync moves the order through
  *                                  shipped → out_for_delivery → delivered
  *
+ * Packing verification (packageService setting `requirePackingVerification`,
+ * default ON): staff weigh + measure the packed parcel (verifyPacking) BEFORE
+ * the order is pushed to Shiprocket, so the Shiprocket order — and the courier
+ * booking — use the ACTUAL dead weight and external size. While it is on, the
+ * automatic push after payment and the retry job skip unverified orders.
+ * A large freight difference (actual courier − checkout quote) blocks booking
+ * until an admin decides (logistics.adjustment); the customer is never charged
+ * more after payment. Only existing Shiprocket endpoints are used: there is no
+ * verified API to change an existing Shiprocket order's weight/size, so an
+ * order already pushed with different measurements must be corrected in the
+ * Shiprocket panel and confirmed by an admin ('panel_updated' override).
+ *
  * Courier updates only ever move an order FORWARD along the fulfilment chain
  * (plus the courier's own out_for_delivery → shipped re-attempt). Terminal
  * states (delivered / refunded / cancelled) are never touched.
@@ -32,6 +44,7 @@ const shiprocket = require('./shiprocketService');
 const packaging = require('./packageService');
 const { pickCheapestCourier, pickExpressCourier } = require('./deliveryService');
 const { ORDER_TRANSITIONS } = require('../config/constants');
+const model = require('../models/orderShipping');
 
 const PROVIDER = 'shiprocket';
 
@@ -101,6 +114,62 @@ function assertEnabled() {
 
 const CLAIM_TTL_MS = 2 * 60 * 1000;
 
+/** Packing verification statuses that allow dispatch. */
+const VERIFIED_STATES = Object.freeze(['verified', 'overridden']);
+/** Gate errors that mean "waiting for staff", not a Shiprocket failure. */
+const WAITING_CODES = Object.freeze(['PACKING_NOT_VERIFIED', 'ADJUSTMENT_PENDING', 'PUSHED_PACKAGE_MISMATCH']);
+
+/** Millis from a Firestore Timestamp, its plain {seconds} form, a Date or an ISO string. */
+function tsOf(v) {
+  if (!v) return 0;
+  if (typeof v.toMillis === 'function') return v.toMillis();
+  const secs = v.seconds ?? v._seconds;
+  if (Number.isFinite(secs)) return secs * 1000 + Math.floor((v.nanoseconds ?? v._nanoseconds ?? 0) / 1e6);
+  return new Date(v).getTime() || 0;
+}
+
+/**
+ * Why this order may not be dispatched yet, or null.
+ * @param {'create'|'awb'} stage
+ */
+function dispatchBlock(order, settings, { stage = 'create' } = {}) {
+  const lg = order.logistics || {};
+  if (settings.requirePackingVerification && !VERIFIED_STATES.includes(lg.verification?.status)) {
+    return { code: 'PACKING_NOT_VERIFIED', message: 'Weigh and measure the packed parcel (Packing verification) before booking the courier.' };
+  }
+  const adj = lg.adjustment?.status || 'none';
+  if (!model.DISPATCH_ALLOWED_ADJUSTMENTS.includes(adj)) {
+    return { code: 'ADJUSTMENT_PENDING', message: `Shipping cost difference needs an admin decision first (${adj.replace(/_/g, ' ')}).` };
+  }
+  if (stage === 'awb' && lg.pushedMismatch) {
+    const measuredAt = tsOf(lg.actual?.measuredAt);
+    const confirmed = (lg.overrides || []).some((o) => o.kind === 'panel_updated' && tsOf(o.at) >= measuredAt);
+    if (!confirmed) {
+      return {
+        code: 'PUSHED_PACKAGE_MISMATCH',
+        message: 'This order was pushed to Shiprocket with different parcel measurements. Update weight and size in the Shiprocket panel, then an admin must confirm "Shiprocket panel updated".',
+      };
+    }
+  }
+  return null;
+}
+
+/** Package payload from a verified measurement (overrides the estimate). */
+function packageFromActual(actual) {
+  return {
+    boxId: actual.packageId || null,
+    boxName: actual.packageName || (actual.packageId ? actual.packageId : 'Custom'),
+    packageType: actual.packageType || 'box',
+    length: actual.length,
+    breadth: actual.breadth,
+    height: actual.height,
+    weightKg: actual.deadKg,
+    volumetricKg: actual.volumetricKg,
+    chargeableKg: actual.chargeableKg,
+    source: 'verified',
+  };
+}
+
 /**
  * Push an order to Shiprocket. Idempotent: an order that already has a
  * Shiprocket shipment is returned as-is.
@@ -111,6 +180,7 @@ const CLAIM_TTL_MS = 2 * 60 * 1000;
 async function createShipmentForOrder(orderId, { source = 'admin', packageOverride = null, force = false } = {}) {
   assertEnabled();
   const orderRef = db.collection('orders').doc(orderId);
+  const settings = await packaging.getPackagingSettings();
 
   // Claim the order so a double click / concurrent auto-create can't push it twice.
   const claimed = await db.runTransaction(async (t) => {
@@ -125,7 +195,12 @@ async function createShipmentForOrder(orderId, { source = 'admin', packageOverri
     if (order.deliveryPartner === 'local' && !force) {
       throw new ShippingError('LOCAL_PARTNER', 'This PIN code is delivered by your local delivery partner. Use "Ship via Shiprocket anyway" to override.', 409);
     }
-    const claimAt = sh.claimedAt?.toMillis ? sh.claimedAt.toMillis() : 0;
+    const block = dispatchBlock(order, settings, { stage: 'create' });
+    if (block) throw new ShippingError(block.code, block.message, 409);
+    if (packageOverride && order.logistics?.verification?.status === 'verified') {
+      throw new ShippingError('ALREADY_MEASURED', 'This parcel was already weighed and measured — re-verify packing to change its size.', 409);
+    }
+    const claimAt = tsOf(sh.claimedAt);
     if (sh.state === 'creating' && Date.now() - claimAt < CLAIM_TTL_MS) {
       throw new ShippingError('BUSY', 'Shipment creation already in progress', 409);
     }
@@ -155,11 +230,14 @@ async function createShipmentForOrder(orderId, { source = 'admin', packageOverri
 
   try {
     let pkg;
+    // A verified measurement always wins: Shiprocket gets the real parcel.
+    const actual = claimed.order.logistics?.verification?.status === 'verified' ? claimed.order.logistics.actual : null;
+    if (actual) pkg = packageFromActual(actual);
     // No staff choice → the box the delivery fee was quoted for at checkout
     // (falls back to auto-fit if that box was since removed from the catalogue).
     const planned = claimed.order.plannedPackage?.boxId;
     try {
-      if (!packageOverride && planned) {
+      if (!pkg && !packageOverride && planned) {
         pkg = await packaging.resolveOrderPackage(claimed.order, { boxId: planned })
           .then((p) => ({ ...p, source: 'checkout' }))
           .catch((err) => (err.code === 'BAD_BOX' ? null : Promise.reject(err)));
@@ -180,6 +258,7 @@ async function createShipmentForOrder(orderId, { source = 'admin', packageOverri
       package: {
         boxId: pkg.boxId,
         boxName: pkg.boxName,
+        packageType: pkg.packageType || 'box',
         length: pkg.length,
         breadth: pkg.breadth,
         height: pkg.height,
@@ -214,6 +293,10 @@ async function autoCreateShipment(orderId) {
     await createShipmentForOrder(orderId, { source: 'auto' });
   } catch (err) {
     if (err instanceof ShippingError && err.code === 'LOCAL_PARTNER') return; // delivered by the local partner
+    if (err instanceof ShippingError && WAITING_CODES.includes(err.code)) {
+      log.info('shipping.awaiting_packing', { orderId, code: err.code });
+      return; // pushed once staff verify the packed parcel
+    }
     log.warn('shipping.auto_create_failed', { orderId, err });
   }
 }
@@ -241,12 +324,14 @@ async function retryFailedShipments({ onGiveUp } = {}) {
     .limit(RETRY_SCAN_LIMIT)
     .get();
   const cutoff = Date.now() - RETRY_MIN_AGE_MS;
+  const settings = await packaging.getPackagingSettings();
 
   for (const doc of snap.docs) {
     out.scanned += 1;
     const o = doc.data();
     const sh = o.shipment || {};
     if (o.deliveryPartner === 'local' || sh.shipmentId || sh.needsAttention) continue;
+    if (dispatchBlock(o, settings, { stage: 'create' })) { out.awaitingPacking = (out.awaitingPacking || 0) + 1; continue; }
     const stale = !sh.state || sh.state === 'failed'
       || (sh.state === 'creating' && tsMs(sh.claimedAt) < Date.now() - CLAIM_TTL_MS);
     if (!stale) continue;
@@ -260,6 +345,7 @@ async function retryFailedShipments({ onGiveUp } = {}) {
       out.succeeded += 1;
       log.info('shipping.retry_ok', { orderId: doc.id, attempt: attempts + 1 });
     } catch (err) {
+      if (err instanceof ShippingError && WAITING_CODES.includes(err.code)) { out.retried -= 1; continue; }
       const giveUp = attempts + 1 >= RETRY_MAX;
       await doc.ref.update({
         'shipment.retryCount': attempts + 1,
@@ -320,9 +406,38 @@ async function listCouriers(orderId) {
 }
 
 /**
- * Assign AWB (chosen or recommended courier), request pickup and fetch the
- * label. Each step is persisted as it completes, so a retry resumes where the
- * previous attempt stopped. Moves the order to `packed`.
+ * Pick the dispatch courier from a fresh quote list.
+ *   staff choice  → that courier (must be in the list)
+ *   otherwise     → the courier quoted at checkout, if still available and in
+ *                   the same delivery category (express for fastest orders);
+ *                   else the next suitable courier in that category
+ *                   (fastest: quickest express; standard: cheapest);
+ *                   fastest with no express courier → cheapest (flagged).
+ * @returns {{ courier: object|null, pick: string }}
+ */
+function chooseDispatchCourier(couriers = [], { method = 'standard', checkout = null, staffId } = {}) {
+  if (staffId) {
+    const c = couriers.find((x) => Number(x.courierId) === Number(staffId)) || null;
+    return { courier: c, pick: 'staff' };
+  }
+  const eligible = method === 'fastest' ? couriers.filter((c) => !c.isSurface && c.rate > 0) : couriers.filter((c) => c.rate > 0);
+  const original = checkout?.courierId != null ? eligible.find((c) => Number(c.courierId) === Number(checkout.courierId)) : null;
+  if (original) return { courier: original, pick: 'checkout_courier' };
+  if (method === 'fastest') {
+    const express = pickExpressCourier(eligible);
+    if (express) return { courier: express, pick: checkout?.courierId != null ? 'express_fallback' : 'express' };
+    const cheapest = pickCheapestCourier(couriers);
+    return { courier: cheapest, pick: 'cheapest_no_express' };
+  }
+  const cheapest = pickCheapestCourier(eligible);
+  return { courier: cheapest, pick: checkout?.courierId != null ? 'cheapest_fallback' : 'cheapest' };
+}
+
+/**
+ * Assign AWB (checkout / fallback / staff courier), request pickup and fetch
+ * the label. Each step is persisted as it completes, so a retry resumes where
+ * the previous attempt stopped; the AWB step is claimed in a transaction so
+ * concurrent clicks can never assign two AWBs. Moves the order to `packed`.
  * @returns {{ shipment, statusChange: { from, to }|null }}
  */
 async function shipOrder(orderId, { courierId, force = false } = {}) {
@@ -331,53 +446,110 @@ async function shipOrder(orderId, { courierId, force = false } = {}) {
   let snap = await orderRef.get();
   if (!snap.exists) throw new ShippingError('NOT_FOUND', 'Order not found', 404);
   let sh = snap.data().shipment || {};
+  const settings = await packaging.getPackagingSettings();
+
+  if (!sh.awb) {
+    const block = dispatchBlock(snap.data(), settings, { stage: 'awb' });
+    if (block) throw new ShippingError(block.code, block.message, 409);
+  }
 
   if (!sh.shipmentId) {
     sh = await createShipmentForOrder(orderId, { force });
   }
 
-  const patch = {};
   if (!sh.awb) {
-    // Courier quotes for this shipment: freight estimate (margin) + express pick for "fastest".
-    let quotes = null;
-    try {
-      quotes = await shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
-    } catch (err) {
-      log.warn('shipping.quote_failed', { orderId, err });
-    }
-    // Default pick: express for fastest orders, otherwise the CHEAPEST courier
-    // for the real parcel (the same rule the checkout fee was quoted with).
-    let chosenId = courierId ? Number(courierId) : undefined;
-    let courierPick = chosenId ? 'staff' : 'recommended';
-    if (!chosenId && quotes) {
-      const express = snap.data().deliveryMethod === 'fastest' ? pickExpressCourier(quotes.couriers) : null;
-      const cheapest = pickCheapestCourier(quotes.couriers);
-      if (express) {
-        chosenId = express.courierId;
-        courierPick = 'express';
-      } else if (cheapest) {
-        chosenId = cheapest.courierId;
-        courierPick = snap.data().deliveryMethod === 'fastest' ? 'cheapest_no_express' : 'cheapest';
+    // Claim the AWB step (double click / two staff) — released on failure.
+    await db.runTransaction(async (t) => {
+      const cur = await t.get(orderRef);
+      const s2 = cur.data().shipment || {};
+      if (s2.awb) return;
+      if (s2.awbClaimAt && Date.now() - tsOf(s2.awbClaimAt) < CLAIM_TTL_MS) {
+        throw new ShippingError('BUSY', 'Courier assignment already in progress', 409);
       }
-    }
-
-    const awb = await shiprocket.assignAwb(sh.shipmentId, chosenId);
-    const assignedId = awb.courierId || chosenId || quotes?.recommendedId;
-    const quote = quotes?.couriers.find((c) => c.courierId === assignedId);
-    Object.assign(patch, {
-      'shipment.awb': awb.awb,
-      'shipment.courierId': awb.courierId || null,
-      'shipment.courierName': awb.courierName || null,
-      'shipment.courierPick': courierPick,
-      'shipment.freightEstimate': quote ? quote.rate : null,
-      'shipment.state': 'awb_assigned',
-      'shipment.awbAssignedAt': admin.firestore.Timestamp.now(),
-      'shipment.error': courierPick === 'cheapest_no_express'
-        ? 'Fastest order, but no express courier serves this PIN — cheapest courier used'
-        : admin.firestore.FieldValue.delete(),
+      t.update(orderRef, { 'shipment.awbClaimAt': admin.firestore.Timestamp.now() });
     });
-    await orderRef.update(patch);
-    sh = { ...sh, awb: awb.awb, courierName: awb.courierName };
+    snap = await orderRef.get();
+    sh = snap.data().shipment || {};
+  }
+
+  try {
+    if (!sh.awb) {
+      const order = snap.data();
+      // Fresh quotes for THIS shipment (Shiprocket uses its stored weight/size).
+      let quotes = null;
+      try {
+        quotes = await shiprocket.checkServiceability({ srOrderId: sh.srOrderId });
+      } catch (err) {
+        log.warn('shipping.quote_failed', { orderId, err });
+      }
+      const checkout = model.checkoutCourierOf(order);
+      const method = order.deliveryMethod === 'fastest' ? 'fastest' : 'standard';
+      let chosenId;
+      let courierPick = 'recommended';
+      let quote = null;
+      if (quotes) {
+        const r = chooseDispatchCourier(quotes.couriers, { method, checkout, staffId: courierId });
+        if (courierId && !r.courier) {
+          throw new ShippingError('COURIER_UNAVAILABLE', 'That courier no longer serves this shipment — choose another.', 409);
+        }
+        if (r.courier) { chosenId = r.courier.courierId; courierPick = r.pick; quote = r.courier; }
+      } else if (courierId) {
+        chosenId = Number(courierId);
+        courierPick = 'staff';
+      }
+
+      // Price check against the checkout quote — a reference, not a guarantee.
+      const checkoutFreight = model.checkoutFreightOf(order);
+      const lg = order.logistics || {};
+      if (quote && checkoutFreight != null && lg.adjustment?.status !== 'approved') {
+        const diff = Math.round((quote.rate - checkoutFreight) * 100) / 100;
+        const verdict = model.adjustmentFor(diff, settings.adjustment);
+        if (verdict.status === 'needs_approval') {
+          await orderRef.update({
+            'logistics.adjustment': { status: 'needs_approval', reason: verdict.reason, freightRs: diff, stage: 'dispatch', at: new Date().toISOString() },
+            'logistics.dispatchQuote': { courierId: quote.courierId, courierName: quote.name || null, rate: quote.rate, pick: courierPick, quotedAt: new Date().toISOString() },
+          });
+          throw new ShippingError('ADJUSTMENT_PENDING', `Courier price ₹${quote.rate} is ₹${diff} above the checkout quote — an admin must approve before booking.`, 409);
+        }
+      }
+
+      const awb = await shiprocket.assignAwb(sh.shipmentId, chosenId);
+      const assignedId = awb.courierId || chosenId || quotes?.recommendedId;
+      const assigned = quotes?.couriers.find((c) => Number(c.courierId) === Number(assignedId)) || quote;
+      const rate = assigned ? assigned.rate : null;
+      const patch = {
+        'shipment.awb': awb.awb,
+        'shipment.courierId': awb.courierId || null,
+        'shipment.courierName': awb.courierName || null,
+        'shipment.courierPick': courierPick,
+        'shipment.freightEstimate': rate,
+        'shipment.state': 'awb_assigned',
+        'shipment.awbAssignedAt': admin.firestore.Timestamp.now(),
+        'shipment.awbClaimAt': admin.firestore.FieldValue.delete(),
+        'shipment.error': courierPick === 'cheapest_no_express'
+          ? 'Fastest order, but no express courier serves this PIN — cheapest courier used'
+          : admin.firestore.FieldValue.delete(),
+        'logistics.dispatchQuote': {
+          courierId: awb.courierId || assignedId || null,
+          courierName: awb.courierName || assigned?.name || null,
+          rate,
+          pick: courierPick,
+          checkoutCourierId: checkout?.courierId ?? null,
+          quotedAt: new Date().toISOString(),
+        },
+      };
+      if (rate != null) {
+        const fee = model.customerFeeOf(order);
+        patch['logistics.actualFreight'] = rate;
+        patch['logistics.freightDifferenceRs'] = checkoutFreight != null ? Math.round((rate - checkoutFreight) * 100) / 100 : null;
+        patch['logistics.marginRs'] = Math.round((fee - rate - (Number(lg.actual?.materialCost) || 0)) * 100) / 100;
+      }
+      await orderRef.update(patch);
+      sh = { ...sh, awb: awb.awb, courierName: awb.courierName };
+    }
+  } catch (err) {
+    if (!sh.awb) await orderRef.update({ 'shipment.awbClaimAt': admin.firestore.FieldValue.delete() }).catch(() => {});
+    throw err;
   }
 
   if (!sh.pickupRequestedAt) {
@@ -573,4 +745,8 @@ module.exports = {
   refreshTracking,
   findOrderIdForWebhook,
   publicShipment,
+  dispatchBlock,
+  chooseDispatchCourier,
+  VERIFIED_STATES,
+  WAITING_CODES,
 };

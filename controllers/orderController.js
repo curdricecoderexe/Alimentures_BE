@@ -4,9 +4,10 @@ const { sendMail } = require('../utils/mailer');
 const { buildOrderEmail, buildAdminOrderAlert } = require('../utils/emailTemplates');
 const whatsapp = require('../services/whatsappService');
 const { buildInvoicePdf } = require('../utils/invoicePdf');
-const { computeDeliveryFee, isValidPincode, DeliveryError } = require('../services/deliveryService');
+const { computeDeliveryFee, isValidPincode, DeliveryError, getPincodeRule, partnerOf, courierRateFor } = require('../services/deliveryService');
 const { autoCreateShipment, cancelShipmentForOrder, publicShipment } = require('../services/shippingService');
-const { variantShipping, quotePackage, packageSnapshot, OVERSIZE_MESSAGE } = require('../services/packageService');
+const { variantShipping, quotePackage, packageSnapshot, getPackagingSettings, OVERSIZE_MESSAGE } = require('../services/packageService');
+const { buildInitialShipping } = require('../models/orderShipping');
 const { DELIVERY_METHODS } = require('../config/deliveryConstants');
 const { createNotification } = require('./notificationController');
 const Razorpay = require('razorpay');
@@ -419,7 +420,8 @@ const isStaffRole = (user) => ['admin', 'staff'].includes(String(user?.role || '
  */
 function orderForViewer(order, user) {
   if (isStaffRole(user)) return order;
-  const { estimatedShippingCost, quotedCourier, plannedPackage, reservationId, ...rest } = order;
+  // `logistics` holds freight costs, margins and packing data — staff only.
+  const { estimatedShippingCost, quotedCourier, plannedPackage, reservationId, logistics, ...rest } = order;
   if (rest.shipment) rest.shipment = publicShipment(rest.shipment); // same allow-list as /shipping/track
   return rest;
 }
@@ -592,6 +594,7 @@ exports.createOrder = async (req, res) => {
         category: product.category || 'General',
         // Packed weight / size snapshot so the parcel matches what was sold.
         ...variantShipping(variants[vi]),
+        ...(product.requiresBox === true ? { requiresBox: true } : {}),
         // Catalogue SKU + tax data for the Shiprocket order / invoice.
         ...(variants[vi]?.sku ? { sku: String(variants[vi].sku) } : {}),
         ...(product.hsn ? { hsn: String(product.hsn) } : {}),
@@ -607,8 +610,15 @@ exports.createOrder = async (req, res) => {
     const deliveryMethod = DELIVERY_METHODS.includes(req.body.deliveryMethod) ? req.body.deliveryMethod : 'standard';
     const resolvePincode = isValidPincode(customerInfo.pincode) ? customerInfo.pincode : '';
     let delivery;
-    // The box this cart auto-packs into — quoted now, reused at dispatch.
-    const plannedPkg = await quotePackage(sanitizedItems);
+    // The package this cart auto-packs into — quoted now, reused at dispatch.
+    // For courier PINs, packaging options are ranked by the real freight for
+    // their chargeable weight (cached quotes), not just by size.
+    const packagingSettings = await getPackagingSettings();
+    const partner = resolvePincode ? partnerOf(await getPincodeRule(resolvePincode)) : 'shiprocket';
+    const rateLookup = resolvePincode && partner === 'shiprocket'
+      ? (kg) => courierRateFor(resolvePincode, kg, deliveryMethod)
+      : undefined;
+    const plannedPkg = await quotePackage(sanitizedItems, { rateLookup });
     try {
       delivery = await computeDeliveryFee({
         pincode: resolvePincode,
@@ -713,6 +723,14 @@ exports.createOrder = async (req, res) => {
         // was quoted for. Dispatch reuses both so the cost matches what was charged.
         quotedCourier: delivery.quotedCourier || null,
         plannedPackage: packageSnapshot(plannedPkg),
+        // Structured estimate-vs-actual record (models/orderShipping.js).
+        logistics: buildInitialShipping({
+          pkg: plannedPkg,
+          quote: delivery.quote,
+          fee: delivery.fee,
+          requireVerification: packagingSettings.requirePackingVerification,
+          partner: delivery.partner || 'shiprocket',
+        }),
         totalAmount,
         discountAmount,
         couponId,
