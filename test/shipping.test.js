@@ -24,8 +24,14 @@ let pin = 600100; // fresh PIN per test → no serviceability cache hits across 
 
 function stub(overrides) { Object.assign(shiprocket, overrides); }
 
+const packaging = require('../services/packageService');
+
 beforeEach(() => {
   db.reset();
+  // These tests cover the legacy flow (push without measuring). The packing
+  // verification flow is covered in test/packingVerification.test.js.
+  db.seed('shippingSettings/packaging', { requirePackingVerification: false });
+  packaging._resetCacheForTests();
   Object.assign(process.env, SR_ENV);
   delete process.env.SHIPROCKET_AUTO_CREATE;
   delivery.invalidateSettingsCache();
@@ -146,7 +152,13 @@ test('the cheapest courier is quoted; fastest is priced from the express courier
   const std = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300 });
   assert.equal(std.fee, 80); // default bands: ≤ ₹80 → ₹80
   assert.equal(std.estimatedShippingCost, 62.5);
-  assert.deepEqual(std.quotedCourier, { courierId: 2, name: 'C2', rate: 62.5 });
+  assert.deepEqual(std.quotedCourier, { courierId: 2, name: 'C2', rate: 62.5, estimatedDays: 4, isSurface: true });
+  // The exact quote is snapshotted for the order.
+  assert.equal(std.quote.courierId, 2);
+  assert.equal(std.quote.freight, 62.5);
+  assert.equal(std.quote.fee, 80);
+  assert.equal(std.quote.method, 'standard');
+  assert.ok(std.quote.quotedAt);
 
   const fast = await delivery.computeDeliveryFee({ pincode: String(pin), subtotal: 300, method: 'fastest' });
   assert.equal(fast.fee, 170); // express ₹150 → band ≤ ₹170

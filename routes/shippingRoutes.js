@@ -37,4 +37,14 @@ router.get('/orders/:id/couriers', verifyToken, isStaff, writeLimiter, ctrl.getC
 router.post('/orders/:id/ship', verifyToken, isStaff, writeLimiter, ctrl.shipOrder);
 router.post('/orders/:id/sync', verifyToken, isStaff, writeLimiter, ctrl.syncTracking);
 
+// Packing verification (staff measure; admin overrides / approves differences)
+router.post('/orders/:id/packing', verifyToken, isStaff, writeLimiter, ctrl.verifyPacking);
+router.post('/orders/:id/packing/override', verifyToken, isAdmin, writeLimiter, ctrl.overridePacking);
+router.post('/orders/:id/adjustment', verifyToken, isAdmin, writeLimiter, ctrl.decideAdjustment);
+
+// Shipping analytics + learned packing allowances (admin)
+router.get('/analytics', verifyToken, isAdmin, ctrl.getAnalytics);
+router.get('/learning', verifyToken, isAdmin, ctrl.getLearning);
+router.put('/learning/:statId', verifyToken, isAdmin, writeLimiter, ctrl.setLearningOverride);
+
 module.exports = router;

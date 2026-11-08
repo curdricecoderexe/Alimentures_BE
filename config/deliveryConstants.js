@@ -54,6 +54,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   courierLinkedFee: true,
   courierFeeMode: 'bands',
   courierFeeMarkupPct: 0, // unused in 'bands' mode
+  // Added on top of the band fee for courier-quoted PINs (₹, shown separately).
+  handlingFee: 0,
+  // % added to the courier quote before band lookup (re-weigh safety margin).
+  freightBufferPct: 0,
   // Each band's fee = its upper limit, so the customer covers the freight in full.
   // Tuned to live quotes from 600113 (e.g. 0.5 kg ≈ ₹82 → ₹100; 1 kg ≈ ₹133 → ₹140).
   courierFeeBands: [

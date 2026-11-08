@@ -88,7 +88,9 @@ function feeForCourierRate(rate, bands) {
  */
 function courierLinkedFeeFor(rate, settings) {
   if (!(rate > 0)) return null;
-  return feeForCourierRate(rate, settings.courierFeeBands);
+  const buffered = rate * (1 + (Number(settings.freightBufferPct) || 0) / 100);
+  const band = feeForCourierRate(buffered, settings.courierFeeBands);
+  return band == null ? null : clampFee(band + (Number(settings.handlingFee) || 0), null);
 }
 
 /** Cheapest courier in a quote list (ties → faster). */
@@ -129,6 +131,13 @@ function normaliseSettings(raw = {}) {
     courierFeeMarkupPct: Math.min(100, Math.max(0, Number.isFinite(Number(raw.courierFeeMarkupPct)) && raw.courierFeeMarkupPct !== ''
       ? Number(raw.courierFeeMarkupPct) : d.courierFeeMarkupPct)),
     courierFeeBands: normaliseFeeBands(raw.courierFeeBands, d.courierFeeBands),
+    // Business handling charge (packing labour / materials), added to every
+    // courier-linked fee and shown to the customer as its own line.
+    handlingFee: clampFee(raw.handlingFee, d.handlingFee),
+    // Safety buffer on the courier quote before it is matched to a band —
+    // covers small re-weigh differences without changing the fee after payment.
+    freightBufferPct: Math.min(50, Math.max(0, Number.isFinite(Number(raw.freightBufferPct)) && raw.freightBufferPct !== ''
+      ? Number(raw.freightBufferPct) : d.freightBufferPct)),
     updatedAt: raw.updatedAt || null,
     updatedBy: raw.updatedBy || null,
   };
@@ -194,7 +203,8 @@ async function getCourierServiceability(pincode, weightKg) {
   const slab = weightSlab(weightKg);
   const key = `${pincode}:${slab}`;
   const hit = _serviceCache.get(key);
-  if (hit && Date.now() - hit.at < SERVICE_TTL_MS) return hit.value;
+  // Identical PIN + billing slab → identical Shiprocket quote; reuse it.
+  if (hit && Date.now() - hit.at < SERVICE_TTL_MS) return { ...hit.value, cached: true };
   try {
     const r = await shiprocket.checkServiceability({ deliveryPincode: pincode, weightKg: slab });
     // Courier transit days + our 1–2 working-day dispatch window (see Shipping Policy).
@@ -212,19 +222,37 @@ async function getCourierServiceability(pincode, weightKg) {
         rate: pick?.rate || null,
         courierId: pick?.courierId ?? null,
         courierName: pick?.name || null,
+        estimatedDays: pick?.estimatedDays || null,
+        isSurface: pick ? !!pick.isSurface : null,
         express: express
-          ? { eta: etaFor(express), rate: express.rate, courierId: express.courierId, courierName: express.name || null }
+          ? { eta: etaFor(express), rate: express.rate, courierId: express.courierId, courierName: express.name || null, estimatedDays: express.estimatedDays || null }
           : null,
       };
     }
+    value = { ...value, slabKg: slab, quotedAt: new Date().toISOString() };
     if (_serviceCache.size >= SERVICE_CACHE_MAX) _serviceCache.delete(_serviceCache.keys().next().value);
     _serviceCache.set(key, { at: Date.now(), value });
-    return value;
+    return { ...value, cached: false };
   } catch (err) {
     log.warn('delivery.shiprocket_serviceability_failed', { pincode, err });
     return null; // fail open — an outage must not block checkout
   }
 }
+
+/**
+ * Freight (₹) for a chargeable weight to a PIN — standard = cheapest courier,
+ * fastest = express. Used by packageService to rank packaging options by real
+ * cost. null when unknown. Cached via getCourierServiceability.
+ */
+async function courierRateFor(pincode, weightKg, method = 'standard') {
+  if (!isValidPincode(pincode)) return null;
+  const c = await getCourierServiceability(normalisePincode(pincode), weightKg);
+  if (!c?.serviceable) return null;
+  return method === 'fastest' ? (c.express?.rate ?? null) : (c.rate ?? null);
+}
+
+/** Test helper. */
+function _clearServiceCache() { _serviceCache.clear(); }
 
 /* ── the resolver ──────────────────────────────────────────────────────── */
 
@@ -294,8 +322,16 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0, weightKg } = {}) 
   }
   if (courier?.rate) {
     out.estimatedShippingCost = courier.rate;
-    out.standard.courier = { courierId: courier.courierId, name: courier.courierName, rate: courier.rate };
+    out.standard.courier = {
+      courierId: courier.courierId, name: courier.courierName, rate: courier.rate,
+      estimatedDays: courier.estimatedDays || null, isSurface: courier.isSurface ?? null,
+    };
   }
+  out.quoteMeta = courier
+    ? { source: courier.cached ? 'cache' : 'live', quotedAt: courier.quotedAt || null, slabKg: courier.slabKg ?? null }
+    : { source: out.partner === 'local' ? 'local' : 'fallback', quotedAt: new Date().toISOString(), slabKg: weightSlab(weightKg) };
+  out.handlingFee = out.partner === 'shiprocket' && courier?.rate ? settings.handlingFee : 0;
+  out.freightBufferPct = settings.freightBufferPct;
 
   // ── standard ──
   // Shiprocket PINs: the band for the live freight quote ALWAYS decides the fee
@@ -355,7 +391,10 @@ async function resolveDeliveryOptions({ pincode, subtotal = 0, weightKg } = {}) 
 
     out.fastest = { available, fee, eta, reason };
     if (courier?.express) {
-      out.fastest.courier = { courierId: courier.express.courierId, name: courier.express.courierName, rate: courier.express.rate };
+      out.fastest.courier = {
+        courierId: courier.express.courierId, name: courier.express.courierName, rate: courier.express.rate,
+        estimatedDays: courier.express.estimatedDays || null, isSurface: false,
+      };
     }
   }
 
@@ -384,11 +423,28 @@ class DeliveryError extends Error {
 async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0, weightKg } = {}) {
   const wanted = method === 'fastest' ? 'fastest' : 'standard';
   const opts = await resolveDeliveryOptions({ pincode, subtotal, weightKg });
-  const extraFor = (o) => ({
+  const extraFor = (o, m) => ({
     partner: opts.partner,
     // Freight + courier for the chosen method — saved on the order, assigned at dispatch.
     estimatedShippingCost: o.courier?.rate ?? opts.estimatedShippingCost,
     quotedCourier: o.courier || null,
+    // Exact pricing inputs, saved on the order as the checkout quote snapshot.
+    quote: {
+      method: m,
+      pincode: opts.pincode,
+      partner: opts.partner,
+      courierId: o.courier?.courierId ?? null,
+      courierName: o.courier?.name ?? null,
+      freight: o.courier?.rate ?? null,
+      estimatedDays: o.courier?.estimatedDays ?? null,
+      fee: o.fee,
+      handlingFee: o.courier?.rate ? opts.handlingFee || 0 : 0,
+      freightBufferPct: opts.freightBufferPct ?? 0,
+      quotedWeightKg: weightKg ?? null,
+      slabKg: opts.quoteMeta?.slabKg ?? null,
+      source: opts.quoteMeta?.source || 'fallback',
+      quotedAt: opts.quoteMeta?.quotedAt || new Date().toISOString(),
+    },
   });
 
   if (!opts.deliveryAvailable) {
@@ -399,7 +455,7 @@ async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0, 
     if (!opts.fastest.available) {
       throw new DeliveryError('FASTEST_UNAVAILABLE', opts.fastest.reason || 'Fastest delivery is not available for this order.');
     }
-    return { fee: opts.fastest.fee, method: 'fastest', eta: opts.fastest.eta, freeDeliveryApplied: false, ...extraFor(opts.fastest) };
+    return { fee: opts.fastest.fee, method: 'fastest', eta: opts.fastest.eta, freeDeliveryApplied: false, ...extraFor(opts.fastest, 'fastest') };
   }
 
   return {
@@ -407,7 +463,7 @@ async function computeDeliveryFee({ pincode, method = 'standard', subtotal = 0, 
     method: 'standard',
     eta: opts.standard.eta,
     freeDeliveryApplied: opts.freeDeliveryApplied,
-    ...extraFor(opts.standard),
+    ...extraFor(opts.standard, 'standard'),
   };
 }
 
@@ -427,5 +483,8 @@ module.exports = {
   pickCheapestCourier,
   pickExpressCourier,
   partnerOf,
+  courierRateFor,
+  weightSlab,
+  _clearServiceCache,
   DeliveryError,
 };

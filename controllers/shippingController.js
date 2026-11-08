@@ -14,6 +14,8 @@ const log = require('../lib/logger');
 const shiprocket = require('../services/shiprocketService');
 const shipping = require('../services/shippingService');
 const packaging = require('../services/packageService');
+const packing = require('../services/packingVerificationService');
+const packingStats = require('../services/packingStatsService');
 const { createNotification } = require('./notificationController');
 const { sendOrderEmail } = require('./orderController');
 const { createAuditLog } = require('../services/auditService');
@@ -204,6 +206,92 @@ exports.shipOrder = async (req, res) => {
     return res.status(200).json({ success: true, data: shipment });
   } catch (err) {
     return sendError(res, req, err, 'shipping.ship_failed');
+  }
+};
+
+/* ── packing verification ──────────────────────────────────────────────── */
+
+const audit = (req, action, resourceId, newState) => createAuditLog({
+  adminId: req.user.uid,
+  adminEmail: req.user.email || 'unknown',
+  action,
+  resourceId,
+  previousState: null,
+  newState,
+  ipAddress: req.ip,
+});
+
+/**
+ * POST /api/shipping/orders/:id/packing  (staff)
+ * Body: { weightKg, length, breadth, height, packageId?, packageType?, materialCost? }
+ */
+exports.verifyPacking = async (req, res) => {
+  try {
+    const data = await packing.verifyPacking(req.params.id, req.body || {}, { by: req.user.email || req.user.uid });
+    audit(req, 'PACKING_VERIFIED', req.params.id, {
+      actual: data.logistics?.actual && {
+        deadKg: data.logistics.actual.deadKg,
+        dims: [data.logistics.actual.length, data.logistics.actual.breadth, data.logistics.actual.height],
+        packageId: data.logistics.actual.packageId,
+      },
+      adjustment: data.logistics?.adjustment?.status,
+    });
+    return res.status(200).json({ success: true, data });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.packing_verify_failed');
+  }
+};
+
+/** POST /api/shipping/orders/:id/packing/override  { kind, reason }  (admin) */
+exports.overridePacking = async (req, res) => {
+  try {
+    const logistics = await packing.overridePacking(req.params.id, req.body || {}, { by: req.user.email || req.user.uid });
+    audit(req, 'PACKING_OVERRIDE', req.params.id, { kind: req.body?.kind, reason: String(req.body?.reason || '').slice(0, 300) });
+    return res.status(200).json({ success: true, data: { logistics } });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.packing_override_failed');
+  }
+};
+
+/** POST /api/shipping/orders/:id/adjustment  { decision, note }  (admin) */
+exports.decideAdjustment = async (req, res) => {
+  try {
+    const logistics = await packing.decideAdjustment(req.params.id, req.body || {}, { by: req.user.email || req.user.uid });
+    audit(req, 'SHIPPING_ADJUSTMENT_DECISION', req.params.id, { decision: req.body?.decision, status: logistics?.adjustment?.status });
+    return res.status(200).json({ success: true, data: { logistics } });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.adjustment_failed');
+  }
+};
+
+/** GET /api/shipping/analytics?days=30  (admin) */
+exports.getAnalytics = async (req, res) => {
+  try {
+    const data = await packing.shippingAnalytics({ days: req.query.days });
+    return res.status(200).json({ success: true, data });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.analytics_failed');
+  }
+};
+
+/** GET /api/shipping/learning  (admin) — learned packing allowances */
+exports.getLearning = async (req, res) => {
+  try {
+    const data = await packingStats.listStats();
+    return res.status(200).json({ success: true, data });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.learning_list_failed');
+  }
+};
+
+/** PUT /api/shipping/learning/:statId  { overrideKg: number|null }  (admin) */
+exports.setLearningOverride = async (req, res) => {
+  try {
+    const data = await packingStats.setOverride(req.params.statId, req.body?.overrideKg ?? null, { by: req.user.email || req.user.uid });
+    audit(req, 'PACKING_LEARNING_OVERRIDE', req.params.statId, data);
+    return res.status(200).json({ success: true, data });
+  } catch (err) {
+    return sendError(res, req, err, 'shipping.learning_override_failed');
   }
 };
 

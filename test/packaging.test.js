@@ -12,10 +12,11 @@ test('a single small pack goes in the small box, not a 1 kg-slab box', () => {
   const p = pkg.buildPackage([{ quantity: 1, selectedWeight: '250g', shipWeightKg: 0.27, dims: { l: 14, b: 10, h: 4 } }], settings);
   assert.equal(p.boxId, 'BX-S');
   assert.deepEqual([p.length, p.breadth, p.height], [15, 12, 8]);
-  // 0.27 contents + 0.06 box + 0.02 packing
-  assert.equal(p.weightKg, 0.35);
+  // 0.27 contents + 0.06 box + 0.02 packing = 0.35, + safety max(3 %, 10 g) = 0.3605 → 0.37
+  assert.equal(p.weightKg, 0.37);
   assert.equal(p.volumetricKg, 0.29);
-  assert.equal(p.chargeableKg, 0.35);
+  assert.equal(p.chargeableKg, 0.37);
+  assert.equal(p.confidence, 'high');
   assert.equal(p.fits, true);
   assert.deepEqual(p.warnings, []);
 });
@@ -24,7 +25,7 @@ test('heavier carts step up to a box whose weight limit and volume fit', () => {
   const p = pkg.buildPackage([{ quantity: 4, selectedWeight: '500g', shipWeightKg: 0.52, dims: { l: 16, b: 11, h: 5 } }], settings);
   // 2.08 kg contents > Medium's 1.5 kg limit → Large
   assert.equal(p.boxId, 'BX-L');
-  assert.equal(p.weightKg, 2.28);
+  assert.equal(p.weightKg, 2.35); // 2.28 base + 3 % safety
 });
 
 test('an item longer than a box side skips that box', () => {
@@ -117,7 +118,7 @@ test('admin box catalogue endpoints save, reject bad input and preview an order 
   await ctrl.getPackage({ params: { id: 'o1' }, query: {}, user, id: 'r' }, prev);
   assert.equal(prev.statusCode, 200, JSON.stringify(prev.body));
   assert.equal(prev.body.data.boxId, 'POUCH-MAILER');
-  assert.equal(prev.body.data.weightKg, 0.31);
+  assert.equal(prev.body.data.weightKg, 0.32); // 0.31 base + 10 g minimum safety
 
   const unknown = mockRes();
   await ctrl.getPackage({ params: { id: 'o1' }, query: { boxId: 'NOPE' }, user, id: 'r' }, unknown);
