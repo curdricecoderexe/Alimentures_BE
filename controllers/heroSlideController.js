@@ -1,7 +1,7 @@
 const db = require('../config/firebase');
 const admin = require('../lib/firebaseAdmin');
 
-const WRITABLE = ['src', 'title', 'subtitle', 'ctaText', 'ctaLink', 'order'];
+const WRITABLE = ['src', 'mobileSrc', 'title', 'subtitle', 'ctaText', 'ctaLink', 'order'];
 
 const pickWritable = (body) => {
   const out = {};

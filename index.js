@@ -160,6 +160,7 @@ app.use('/api/shipping/webhook', express.text({ type: () => true, limit: '1mb' }
 // populate req.body wins.
 const largeJson = express.json({ limit: LIMITS.JSON_BODY_WITH_IMAGE });
 ['/api/products', '/api/super-grains', '/api/hero-slides', '/api/settings', '/api/orders',
+  '/api/blog', // article cover images
   '/api/appearance', // customisable background images
   '/api/admin/delivery'] // CSV / bulk PIN-code import payloads
   .forEach((p) => app.use(p, largeJson));
@@ -191,7 +192,7 @@ app.use("/api", globalLimiter);
 
 // Let browsers briefly reuse anonymous catalogue reads (storefront browsing).
 // Signed-in requests can see drafts/private items, so they are never cached.
-const PUBLIC_CACHE_PATHS = ['/api/products', '/api/hero-slides', '/api/super-grains', '/api/appearance'];
+const PUBLIC_CACHE_PATHS = ['/api/products', '/api/hero-slides', '/api/super-grains', '/api/appearance', '/api/blog'];
 const { ID_COOKIE, REFRESH_COOKIE } = require('./lib/session');
 app.use(PUBLIC_CACHE_PATHS, (req, res, next) => {
   const cookies = req.headers.cookie || '';
@@ -230,6 +231,8 @@ const homeVideoRoutes = require("./routes/homeVideoRoutes");
 const categoryRoutes = require("./routes/categoryRoutes");
 const catalogueRoutes = require("./routes/catalogueRoutes");
 const newsletterRoutes = require("./routes/newsletterRoutes");
+const blogRoutes = require("./routes/blogRoutes");
+const hamperRoutes = require("./routes/hamperRoutes");
 
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
@@ -254,6 +257,8 @@ app.use("/api/home-video", homeVideoRoutes);
 app.use("/api/categories", categoryRoutes);
 app.use("/api/catalogue", catalogueRoutes);
 app.use("/api/newsletter", newsletterRoutes);
+app.use("/api/blog", blogRoutes);
+app.use("/api/hampers", hamperRoutes);
 
 // ─── 9. HEALTH ────────────────────────────────────────────────────────────────
 const db = require('./config/firebase');

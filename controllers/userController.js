@@ -53,7 +53,11 @@ async function clearLoginFailures(email) {
 
 exports.loginUser = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    // Same normalisation as register/reset: the OTP is stored under this key and
+    // the client verifies with Firebase's (lowercase) email, so "User@Gmail.com"
+    // must not create a different OTP record than "user@gmail.com".
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const { password } = req.body;
 
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required" });
@@ -163,7 +167,8 @@ exports.loginUser = async (req, res) => {
 // OTP mailed to the account is confirmed.
 exports.verifyLoginOtp = async (req, res) => {
   try {
-    const { email, otp } = req.body;
+    const email = String(req.body.email || "").trim().toLowerCase();
+    const { otp } = req.body;
     if (!email || !otp) {
       return res.status(400).json({ error: "Email and OTP are required" });
     }

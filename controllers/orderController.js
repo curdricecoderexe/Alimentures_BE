@@ -1,7 +1,8 @@
 const admin = require('../lib/firebaseAdmin');
 const db = require("../config/firebase");
 const { sendMail } = require('../utils/mailer');
-const { buildOrderEmail, buildAdminOrderAlert } = require('../utils/emailTemplates');
+const { buildOrderEmail, buildAdminOrderAlert, buildOtpEmail } = require('../utils/emailTemplates');
+const { issueOtp, verifyOtp, OTP_ERROR_MESSAGE } = require('../utils/otp');
 const whatsapp = require('../services/whatsappService');
 const { buildInvoicePdf } = require('../utils/invoicePdf');
 const { computeDeliveryFee, isValidPincode, DeliveryError, getPincodeRule, partnerOf, courierRateFor } = require('../services/deliveryService');
@@ -114,6 +115,7 @@ async function consumeCouponInTxn(t, { couponRef, uid, subtotal, pending = false
   const isExpired = coupon.expiresAt &&
     new Date(coupon.expiresAt.toDate ? coupon.expiresAt.toDate() : coupon.expiresAt) < new Date();
   if (!coupon.isActive || isExpired) throw new Error('COUPON_INVALID');
+  if (coupon.assignedTo && coupon.assignedTo !== uid) throw new Error('COUPON_INVALID'); // personal coupon
   if (subtotal < (coupon.minOrderValue || 0)) throw new Error('COUPON_INVALID');
   if ((coupon.usedCount || 0) >= (coupon.maxUsage || 1)) throw new Error('COUPON_LIMIT');
 
@@ -1316,49 +1318,94 @@ exports.refundOrder = async (req, res) => {
 // orders must be cancelled or refunded first (which restores stock and money);
 // an unpaid `payment_pending` order is checked with Razorpay and its stock
 // reservation released before it goes.
-const DELETABLE_STATUSES = ['cancelled', 'refunded', 'payment_failed', 'failed', 'payment_pending'];
 
-exports.deleteOrder = async (req, res) => {
+// ── OTP-protected deletion (any status) ─────────────────────────────────────
+// Admin → Orders can delete any order — including paid ones — after confirming
+// a one-time code emailed to the signed-in admin. Every deleted order is first
+// copied to `deletedOrders` (full document + who/when) so sales and GST records
+// can be recovered, and each deletion is audit-logged.
+const DELETE_OTP_COLLECTION = 'orderDeleteOtps';
+const MAX_BULK_DELETE = 200;
+
+// POST /api/orders/admin/delete-otp — email a code to the signed-in admin
+exports.requestDeleteOtp = async (req, res) => {
   try {
-    const { id } = req.params;
-    const docRef = db.collection("orders").doc(id);
-    const snap = await docRef.get();
-    if (!snap.exists) return res.status(404).json({ success: false, error: "Order not found" });
-    const order = snap.data();
-    const status = String(order.status || '').toLowerCase();
-
-    if (!DELETABLE_STATUSES.includes(status)) {
-      return res.status(409).json({
-        success: false,
-        error: "Only cancelled, refunded, failed or unpaid orders can be deleted. Cancel or refund this order first.",
-      });
+    const email = req.user?.email;
+    if (!email) return res.status(400).json({ success: false, error: 'Your admin account has no email address for the code' });
+    const otp = await issueOtp(DELETE_OTP_COLLECTION, req.user.uid);
+    const { subject, text, html } = buildOtpEmail({ purpose: 'order_delete', otp });
+    const sent = await sendMail(email, subject, text, html);
+    if (sent && sent.success === false) {
+      return res.status(503).json({ success: false, error: 'Could not send the code — email is not configured on the server' });
     }
-    if (status === 'payment_pending') {
-      if (await reconcileRazorpayOrder(id, order)) {
-        return res.status(409).json({ success: false, error: "Payment for this order has just been received — it can't be deleted." });
-      }
-      if (order.reservationId) await releaseReservation(order.reservationId, 'RELEASED');
-    }
-
-    await docRef.delete();
-    createAuditLog({
-      adminId: req.user?.uid,
-      adminEmail: req.user?.email || 'unknown',
-      action: 'DELETE_ORDER',
-      resourceId: id,
-      previousState: {
-        status: order.status,
-        totalAmount: order.totalAmount,
-        customer: order.customerInfo?.email || order.userEmail || null,
-        itemCount: (order.items || []).length,
-      },
-      newState: null,
-      ipAddress: req.ip,
-    });
-    return res.status(200).json({ success: true, message: "Order deleted" });
+    const [name, domain] = email.split('@');
+    return res.status(200).json({ success: true, data: { sentTo: `${name.slice(0, 2)}${'•'.repeat(Math.max(1, name.length - 2))}@${domain}` } });
   } catch (err) {
-    log.error('order.delete_failed', { requestId: req.id, orderId: req.params.id, err });
-    return res.status(500).json({ success: false, error: "Failed to delete order" });
+    log.error('order.delete_otp_failed', { requestId: req.id, err });
+    return res.status(500).json({ success: false, error: 'Could not send the verification code' });
   }
 };
+
+// POST /api/orders/admin/delete — { ids: [...], otp }
+exports.deleteOrdersWithOtp = async (req, res) => {
+  try {
+    const ids = [...new Set((req.body?.ids || []).map(String).filter(Boolean))];
+    const otp = String(req.body?.otp || '').trim();
+    if (!ids.length) return res.status(400).json({ success: false, error: 'Choose at least one order' });
+    if (ids.length > MAX_BULK_DELETE) return res.status(400).json({ success: false, error: `Delete at most ${MAX_BULK_DELETE} orders at a time` });
+    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, error: 'Enter the 6-digit code' });
+
+    const check = await verifyOtp(DELETE_OTP_COLLECTION, req.user.uid, otp);
+    if (!check.ok) {
+      const msg = check.reason === 'not_requested' ? 'Request a verification code first' : OTP_ERROR_MESSAGE[check.reason];
+      return res.status(400).json({ success: false, error: msg });
+    }
+
+    const deleted = [];
+    const missing = [];
+    for (const id of ids) {
+      const ref = db.collection('orders').doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) { missing.push(id); continue; }
+      const order = snap.data();
+      const status = String(order.status || '').toLowerCase();
+
+      // An unpaid order still holds reserved stock — give it back.
+      if (status === 'payment_pending' && order.reservationId) {
+        try { await releaseReservation(order.reservationId, 'RELEASED'); } catch (e) { log.warn('order.delete_release_failed', { orderId: id, err: e }); }
+      }
+
+      await db.collection('deletedOrders').doc(id).set({
+        ...order,
+        deletedAt: new Date().toISOString(),
+        deletedBy: { uid: req.user.uid, email: req.user.email || null },
+      });
+      await ref.delete();
+      deleted.push(id);
+
+      createAuditLog({
+        adminId: req.user?.uid,
+        adminEmail: req.user?.email || 'unknown',
+        action: 'DELETE_ORDER',
+        resourceId: id,
+        previousState: {
+          status: order.status,
+          totalAmount: order.totalAmount,
+          customer: order.customerInfo?.email || order.userEmail || null,
+          itemCount: (order.items || []).length,
+          archivedTo: `deletedOrders/${id}`,
+          otpVerified: true,
+        },
+        newState: null,
+        ipAddress: req.ip,
+      });
+    }
+
+    return res.status(200).json({ success: true, data: { deleted, missing } });
+  } catch (err) {
+    log.error('order.bulk_delete_failed', { requestId: req.id, err });
+    return res.status(500).json({ success: false, error: 'Failed to delete orders' });
+  }
+};
+
 

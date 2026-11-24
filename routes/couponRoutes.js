@@ -7,6 +7,7 @@ const {
   deleteCoupon,
   toggleCoupon,
   validateCoupon,
+  getWelcomeCoupon,
 } = require("../controllers/couponController");
 
 const verifyToken = require("../middlewares/verifyToken");
@@ -21,5 +22,8 @@ router.patch("/:id/toggle", verifyToken, isAdmin, toggleCoupon);
 
 // Customer preview — rate-limited to prevent code brute-forcing
 router.post("/validate", verifyToken, couponLimiter, validateCoupon);
+
+// Customer — personal first-order welcome offer (created on first request)
+router.get("/welcome", verifyToken, getWelcomeCoupon);
 
 module.exports = router;

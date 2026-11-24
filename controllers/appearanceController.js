@@ -12,22 +12,29 @@ const {
 
 // Small in-process cache so a homepage load is one Firestore read at most per
 // minute regardless of traffic. Invalidated on every write.
-let _cache = { at: 0, data: null };
+let _cache = {}; // page ('' = site-wide) -> { at, data }
 const CACHE_MS = 60 * 1000;
 
-/** Public — the { slotKey: imageDataUri|url } map the storefront consumes. */
+/**
+ * Public — the { slotKey: imageDataUri|url } map the storefront consumes.
+ * Without ?page it returns the site-wide slots; ?page=hampers returns the
+ * Gift Hampers page's own slots.
+ */
 exports.getAppearance = async (req, res) => {
   try {
-    if (_cache.data && Date.now() - _cache.at < CACHE_MS) {
-      return res.json({ success: true, data: _cache.data });
+    const page = typeof req.query.page === 'string' ? req.query.page : '';
+    const keys = APPEARANCE_SLOTS.filter((s) => (s.page || '') === page).map((s) => s.key);
+    const hit = _cache[page];
+    if (hit && Date.now() - hit.at < CACHE_MS) {
+      return res.json({ success: true, data: hit.data });
     }
     const snap = await db.collection(APPEARANCE_COLLECTION).get();
     const data = {};
     snap.forEach((doc) => {
       const v = doc.data();
-      if (APPEARANCE_KEYS.includes(doc.id) && v && v.image) data[doc.id] = v.image;
+      if (keys.includes(doc.id) && v && v.image) data[doc.id] = v.image;
     });
-    _cache = { at: Date.now(), data };
+    _cache[page] = { at: Date.now(), data };
     res.json({ success: true, data });
   } catch (error) {
     log.error('appearance.get_failed', { requestId: req.id, err: error });
@@ -58,7 +65,7 @@ exports.updateAsset = async (req, res) => {
       },
       { merge: true },
     );
-    _cache = { at: 0, data: null };
+    _cache = {};
 
     createAuditLog({
       adminId: req.user?.uid,
@@ -85,7 +92,7 @@ exports.deleteAsset = async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unknown appearance slot' });
     }
     await db.collection(APPEARANCE_COLLECTION).doc(key).delete();
-    _cache = { at: 0, data: null };
+    _cache = {};
 
     createAuditLog({
       adminId: req.user?.uid,

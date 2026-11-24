@@ -7,7 +7,7 @@
 
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { db, razorpayCalls, razorpayBehaviour, mockRes, sign } = require('./helpers/setup');
+const { db, razorpayCalls, razorpayBehaviour, mockRes, sign, mailsSent } = require('./helpers/setup');
 const orders = require('../controllers/orderController');
 
 const USER = { uid: 'user1', email: 'buyer@example.com', role: 'customer' };
@@ -254,18 +254,44 @@ test('expiry cleanup confirms instead of cancelling when Razorpay shows it was p
 
 // ── admin delete ─────────────────────────────────────────────────────────────
 
-test('deleteOrder refuses active paid orders and deletes closed ones', async () => {
+test('deleting orders needs the emailed OTP; any status can go and is archived first', async () => {
   db.seed('orders/paid', { status: 'pending', totalAmount: 100, items: [] });
   db.seed('orders/done', { status: 'cancelled', totalAmount: 100, items: [] });
   const admin = { uid: 'a1', role: 'admin', email: 'admin@example.com' };
 
-  const r1 = mockRes();
-  await orders.deleteOrder({ params: { id: 'paid' }, user: admin, id: 'req' }, r1);
-  assert.equal(r1.statusCode, 409);
+  // no code requested yet
+  const r0 = mockRes();
+  await orders.deleteOrdersWithOtp({ body: { ids: ['paid'], otp: '123456' }, user: admin, id: 'req' }, r0);
+  assert.equal(r0.statusCode, 400);
   assert.ok(db.read('orders/paid'));
 
-  const r2 = mockRes();
-  await orders.deleteOrder({ params: { id: 'done' }, user: admin, id: 'req' }, r2);
-  assert.equal(r2.statusCode, 200);
-  assert.equal(db.read('orders/done'), undefined);
+  const sent = mockRes();
+  await orders.requestDeleteOtp({ user: admin, id: 'req' }, sent);
+  assert.equal(sent.statusCode, 200);
+  assert.ok(mailsSent.some((m) => m.to === 'admin@example.com'));
+
+  // wrong code keeps everything
+  const bad = mockRes();
+  await orders.deleteOrdersWithOtp({ body: { ids: ['paid'], otp: '000000' }, user: admin, id: 'req' }, bad);
+  assert.equal(bad.statusCode, 400);
+  assert.ok(db.read('orders/paid'));
+
+  // right code (read the issued hash by re-issuing a known code)
+  const { hashOtp } = require('../utils/otp');
+  db.seed('orderDeleteOtps/a1', { hash: hashOtp('424242'), attempts: 0, lockedUntil: null, createdAt: new Date() });
+  const ok = mockRes();
+  await orders.deleteOrdersWithOtp({ body: { ids: ['paid', 'done', 'ghost'], otp: '424242' }, user: admin, id: 'req' }, ok);
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(ok.body.data.deleted, ['paid', 'done']);
+  assert.deepEqual(ok.body.data.missing, ['ghost']);
+  assert.equal(db.read('orders/paid'), undefined);
+  assert.equal(db.read('deletedOrders/paid').totalAmount, 100);
+  assert.equal(db.read('deletedOrders/paid').deletedBy.uid, 'a1');
+
+  // the code is single-use
+  db.seed('orders/again', { status: 'cancelled', items: [] });
+  const reuse = mockRes();
+  await orders.deleteOrdersWithOtp({ body: { ids: ['again'], otp: '424242' }, user: admin, id: 'req' }, reuse);
+  assert.equal(reuse.statusCode, 400);
+  assert.ok(db.read('orders/again'));
 });

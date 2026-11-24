@@ -13,13 +13,14 @@ const {
   cleanupExpiredReservations,
   abandonPayment,
   refundOrder,
-  deleteOrder,
+  requestDeleteOtp,
+  deleteOrdersWithOtp,
 } = require("../controllers/orderController");
 
 const verifyToken = require("../middlewares/verifyToken");
 const isAdmin = require("../middlewares/isAdmin");
 const isStaff = require("../middlewares/isStaff");
-const { orderLimiter } = require("../middlewares/rateLimiters");
+const { orderLimiter, otpLimiter } = require("../middlewares/rateLimiters");
 const cronOrAdmin = require("../middlewares/cronAuth");
 
 // Razorpay
@@ -46,7 +47,9 @@ router.put("/:id/abandon-payment", verifyToken, abandonPayment);
 // Refund (admin only)
 router.post("/:id/refund", verifyToken, isAdmin, refundOrder);
 
-// Admin: permanently delete a closed (cancelled / refunded / failed / unpaid) order.
-router.delete("/:id", verifyToken, isAdmin, deleteOrder);
+// Admin: permanently delete any order(s) — confirmed with a one-time code
+// emailed to the admin; each order is archived to `deletedOrders` first.
+router.post("/admin/delete-otp", verifyToken, isAdmin, otpLimiter, requestDeleteOtp);
+router.post("/admin/delete", verifyToken, isAdmin, deleteOrdersWithOtp);
 
 module.exports = router;

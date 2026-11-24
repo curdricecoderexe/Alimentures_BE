@@ -123,6 +123,78 @@ exports.toggleCoupon = async (req, res) => {
   }
 };
 
+// ── Welcome offer ───────────────────────────────────────────────────────────
+// Every customer who hasn't placed an order yet gets a personal, single-use
+// 10%-off code. It is created the first time it's asked for (first sign-in /
+// checkout), locked to that account (`assignedTo`), and stops being offered
+// once they've placed an order or used it.
+const WELCOME_PERCENT = 10;
+const NOT_PLACED = new Set(['payment_pending', 'payment_failed', 'cancelled']);
+
+async function hasPlacedOrder(uid) {
+  const snap = await db.collection("orders").where("userId", "==", uid).get();
+  return snap.docs.some((d) => !NOT_PLACED.has(d.data().status));
+}
+
+// GET /api/coupons/welcome — Customer: their welcome coupon, or null
+exports.getWelcomeCoupon = async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    if ((req.user.role || 'customer') !== 'customer' || await hasPlacedOrder(uid)) {
+      return res.status(200).json({ success: true, data: null });
+    }
+
+    const mine = await db.collection("coupons").where("assignedTo", "==", uid).get();
+    let doc = mine.docs.find((d) => d.data().kind === 'welcome');
+    let coupon;
+
+    if (doc) {
+      coupon = { id: doc.id, ...doc.data() };
+      const used = await db.collection("couponRedemptions").doc(`${coupon.id}_${uid}`).get();
+      if (used.exists || !coupon.isActive) return res.status(200).json({ success: true, data: null });
+    } else {
+      let code;
+      for (let i = 0; i < 5 && !code; i++) {
+        const candidate = generateCode("WELCOME10", 6);
+        const clash = await db.collection("coupons").where("code", "==", candidate).limit(1).get();
+        if (clash.empty) code = candidate;
+      }
+      if (!code) throw new Error("could not allocate a welcome code");
+      coupon = {
+        code,
+        kind: 'welcome',
+        assignedTo: uid,
+        discountType: "percentage",
+        discountValue: WELCOME_PERCENT,
+        minOrderValue: 0,
+        maxUsage: 1,
+        usedCount: 0,
+        isActive: true,
+        description: `Welcome offer — ${WELCOME_PERCENT}% off your first order`,
+        expiresAt: null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdBy: "system",
+      };
+      const ref = await db.collection("coupons").add(coupon);
+      coupon.id = ref.id;
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: coupon.id,
+        code: coupon.code,
+        discountType: coupon.discountType,
+        discountValue: coupon.discountValue,
+        description: coupon.description,
+      },
+    });
+  } catch (err) {
+    console.error("WELCOME COUPON ERROR:", err);
+    return res.status(500).json({ success: false, error: "Could not load your welcome offer" });
+  }
+};
+
 // POST /api/coupons/validate — Customer: validate & apply coupon (preview only;
 // the authoritative check + consumption happens atomically at order creation).
 exports.validateCoupon = async (req, res) => {
@@ -142,6 +214,11 @@ exports.validateCoupon = async (req, res) => {
 
     if (!coupon.isActive) {
       return res.status(400).json({ success: false, error: "This coupon is no longer active" });
+    }
+
+    // Personal coupons (e.g. the welcome offer) only work for their owner.
+    if (coupon.assignedTo && coupon.assignedTo !== req.user.uid) {
+      return res.status(404).json({ success: false, error: "Invalid coupon code" });
     }
 
     if (coupon.expiresAt && new Date(coupon.expiresAt.toDate ? coupon.expiresAt.toDate() : coupon.expiresAt) < new Date()) {

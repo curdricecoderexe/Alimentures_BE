@@ -51,6 +51,86 @@ const MAX_SOCIAL_LINKS = 12;
 
 exports.SOCIAL_PLATFORMS = SOCIAL_PLATFORMS;
 
+/**
+ * About page → "Our commitment" band copy — Admin → About Page.
+ * Stored on settings/storefront as `commitment` { eyebrow, headline, highlight,
+ * pledges: [string ×1–3], ctaLabel, ctaLink }. Body is pre-validated by the route.
+ */
+exports.updateCommitment = async (req, res) => {
+  try {
+    const b = req.body;
+    const pledges = (b.pledges || []).map((p) => String(p).trim()).filter(Boolean);
+    if (pledges.length < 1 || pledges.length > 3) {
+      return res.status(400).json({ success: false, error: "Add between one and three commitments" });
+    }
+    if (pledges.some((p) => p.length > 60)) {
+      return res.status(400).json({ success: false, error: "Each commitment must be 60 characters or fewer" });
+    }
+    const commitment = {
+      eyebrow: b.eyebrow || 'Our commitment',
+      headline: b.headline,
+      highlight: b.highlight || '',
+      pledges,
+      ctaLabel: b.ctaLabel || 'Shop',
+      ctaLink: b.ctaLink || '/shop',
+    };
+
+    await db.collection("settings").doc("storefront").set({
+      commitment,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+
+    createAuditLog({
+      adminId: req.user?.uid,
+      adminEmail: req.user?.email || 'unknown',
+      action: 'UPDATE_COMMITMENT_COPY',
+      resourceId: 'storefront',
+      previousState: null,
+      newState: { commitment },
+      ipAddress: req.ip,
+    });
+
+    return res.status(200).json({ success: true, data: { commitment } });
+  } catch (error) {
+    log.error("settings.commitment_update_failed", { requestId: req.id, err: error });
+    return res.status(500).json({ success: false, error: "Failed to save the commitment section" });
+  }
+};
+
+/**
+ * Gift Hampers page visibility — Admin → Gift Hampers.
+ * Stored on settings/storefront as `hampersVisible` (missing = visible). When
+ * false the storefront hides the page and every link to it.
+ */
+exports.updateHampersVisibility = async (req, res) => {
+  try {
+    const visible = req.body?.visible;
+    if (typeof visible !== 'boolean') {
+      return res.status(400).json({ success: false, error: "visible must be true or false" });
+    }
+
+    await db.collection("settings").doc("storefront").set({
+      hampersVisible: visible,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+
+    createAuditLog({
+      adminId: req.user?.uid,
+      adminEmail: req.user?.email || 'unknown',
+      action: 'UPDATE_HAMPERS_VISIBILITY',
+      resourceId: 'storefront',
+      previousState: null,
+      newState: { hampersVisible: visible },
+      ipAddress: req.ip,
+    });
+
+    return res.status(200).json({ success: true, data: { hampersVisible: visible } });
+  } catch (error) {
+    log.error("settings.hampers_update_failed", { requestId: req.id, err: error });
+    return res.status(500).json({ success: false, error: "Failed to update the Gift Hampers page" });
+  }
+};
+
 exports.updateSocialLinks = async (req, res) => {
   try {
     const raw = req.body?.socialLinks;

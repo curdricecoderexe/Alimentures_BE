@@ -437,6 +437,7 @@ const OTP_COPY = {
   login: { icon: '🔐', subject: 'Your Alimenture sign-in code', eyebrow: 'Sign-in verification', heading: "Verify it's you", blurb: 'Use this code to finish signing in to your Alimenture account.' },
   register: { icon: '🌾', subject: 'Your Alimenture verification code', eyebrow: 'Welcome to Alimenture', heading: 'Confirm your email', blurb: 'Use this code to finish creating your Alimenture account.' },
   reset: { icon: '🔑', subject: 'Your Alimenture password reset code', eyebrow: 'Password reset', heading: 'Reset your password', blurb: 'Use this code to choose a new password for your Alimenture account.' },
+  order_delete: { icon: '🛡️', subject: 'Confirm order deletion — Alimenture admin', eyebrow: 'Admin verification', heading: 'Confirm deleting orders', blurb: 'Use this code to confirm permanently deleting orders from the admin dashboard. If this wasn’t you, change your password now.' },
 };
 
 /**
