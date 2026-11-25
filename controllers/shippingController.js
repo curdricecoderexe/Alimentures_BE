@@ -38,20 +38,11 @@ function notifyStatusChange(orderId, change) {
   if (change.to) {
     const label = change.to.replace(/_/g, ' ');
     sendOrderEmail(orderId, 'status', { status: change.to });
-    ['admin', 'staff'].forEach((target) => {
-      createNotification(target, 'Order Status Updated', `Order ${short} is now ${label} (Shiprocket)`);
-    });
-    if (change.order?.userId) {
-      createNotification(change.order.userId, 'Order Update', `Your order ${short} is now ${label}`);
-    }
+    createNotification('admin', 'Order Status Updated', `Order ${short} is now ${label} (Shiprocket)`, { orderId });
   }
   if (change.alert && ALERT_TEXT[change.alert]) {
     const [title, body] = ALERT_TEXT[change.alert](short);
-    ['admin', 'staff'].forEach((target) => createNotification(target, title, body));
-    if (change.alert === 'ndr' && change.order?.userId) {
-      createNotification(change.order.userId, 'Delivery attempt missed',
-        `The courier couldn't deliver order ${short}. Please keep your phone reachable — they will try again.`);
-    }
+    createNotification('admin', title, body, { orderId });
   }
 }
 exports.notifyStatusChange = notifyStatusChange;

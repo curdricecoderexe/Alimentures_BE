@@ -1,4 +1,6 @@
 const admin = require('../lib/firebaseAdmin');
+const memoCache = require('../lib/memoCache');
+const listCache = memoCache({ ttlMs: 10 * 60 * 1000 }); // public list, cleared on every admin write
 const db = require("../config/firebase");
 
 const validateSuperGrain = (data, isUpdate = false) => {
@@ -25,6 +27,7 @@ exports.createSuperGrain = async (req, res) => {
     };
 
     const doc = await db.collection("super_grains").add(grainData);
+    listCache.clear();
 
     return res.status(201).json({ success: true, id: doc.id });
   } catch (err) {
@@ -35,8 +38,10 @@ exports.createSuperGrain = async (req, res) => {
 
 exports.getSuperGrains = async (req, res) => {
   try {
-    const snapshot = await db.collection("super_grains").orderBy("createdAt", "asc").get();
-    const grains = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const grains = await listCache.get('all', async () => {
+      const snapshot = await db.collection("super_grains").orderBy("createdAt", "asc").get();
+      return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    });
 
     return res.status(200).json({
       success: true,
@@ -68,6 +73,7 @@ exports.updateSuperGrain = async (req, res) => {
     if (!existing.exists) return res.status(404).json({ success: false, error: "Super Grain not found" });
 
     await docRef.update(updates);
+    listCache.clear();
     return res.status(200).json({ success: true, message: "Super Grain updated" });
   } catch (err) {
     console.error("UPDATE SUPER GRAIN ERROR:", err);
@@ -83,6 +89,7 @@ exports.deleteSuperGrain = async (req, res) => {
     if (!doc.exists) return res.status(404).json({ success: false, error: "Not found" });
 
     await docRef.delete();
+    listCache.clear();
     return res.status(200).json({ success: true, message: "Super Grain deleted" });
   } catch (err) {
     console.error("DELETE SUPER GRAIN ERROR:", err);

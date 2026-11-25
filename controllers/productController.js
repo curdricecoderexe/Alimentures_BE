@@ -97,9 +97,9 @@ let slugMap = new Map(); // product id -> canonical URL slug, rebuilt with the c
 
 /** Attach the canonical URL slug (see lib/slug.js) to a product object. */
 const withSlug = (p) => ({ ...p, slug: slugMap.get(p.id) || slugify(p.slug || p.title || p.name) || p.id });
-// Short TTL: cached products carry stock ("Sold out"), which orders change
-// without invalidating the cache.
-const CACHE_TTL = 60 * 1000;
+// Cached products carry stock ("Sold out"). Order transactions invalidate the
+// cache (orderController.runStockTxn), so the TTL is only a safety net.
+const CACHE_TTL = 5 * 60 * 1000;
 
 const SEARCH_CACHE_LIMIT = 2000; // beyond this the catalogue needs a real search service
 
@@ -390,6 +390,23 @@ exports.getProducts = async (req, res) => {
       });
     }
 
+    // Staff/admin first page (dashboard, admin storefront browsing): same cache,
+    // drafts and private products included. Later pages (lastId) still page
+    // through Firestore. The cache is reset by every product edit and order
+    // transaction, so admins see changes immediately.
+    if (staff && !lastId) {
+      if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
+      if (productCache.length < SEARCH_CACHE_LIMIT) {
+        const products = productCache.slice(0, limit).map(withSlug);
+        return res.status(200).json({
+          success: true,
+          count: products.length,
+          lastId: products.length > 0 ? products[products.length - 1].id : null,
+          data: products,
+        });
+      }
+    }
+
     const fetchLimit = staff ? limit : Math.min(LIMITS.LIST_LIMIT_MAX, limit * 2);
     let query = db.collection("products").orderBy("createdAt", "desc").limit(fetchLimit);
 
@@ -426,14 +443,13 @@ exports.getLowStockProducts = async (req, res) => {
   try {
     // Bounded scan — a catalogue larger than this needs a maintained
     // `totalStock` field + an inequality query instead.
-    const snapshot = await db.collection("products")
-      .select("title", "name", "stock", "variants", "image")
-      .limit(1000)
-      .get();
+    // Served from the in-memory catalogue (kept fresh by product edits and
+    // order transactions) instead of scanning every product on each dashboard load.
+    if (Date.now() - cacheTimestamp > CACHE_TTL || productCache.length === 0) await refreshCache();
     const lowStock = [];
-    
-    snapshot.forEach(doc => {
-      const p = doc.data();
+
+    productCache.forEach(p => {
+      const doc = { id: p.id };
       const totalStock = p.stock !== undefined ? p.stock : (p.variants ? p.variants.reduce((s, v) => s + (Number(v.stock) || 0), 0) : 0);
       const lowVariants = (p.variants || []).filter(v => Number(v.stock) < 10);
       

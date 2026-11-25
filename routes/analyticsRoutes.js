@@ -2,6 +2,11 @@ const express = require('express');
 const router  = express.Router();
 const ctrl    = require('../controllers/analyticsController');
 const { analyticsLimiter, analyticsDailyLimiter } = require('../middlewares/rateLimiters');
+const responseCache = require('../middlewares/responseCache');
+
+// Dashboard reads scan thousands of raw docs; numbers only need to be minutes-fresh.
+const dash = responseCache(5 * 60 * 1000);
+const live = responseCache(60 * 1000);
 
 // ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
 router.get('/ping', ctrl.ping);
@@ -19,19 +24,19 @@ router.post('/performance',  ingestLimits, ctrl.ingestPerformance);
 const verifyToken = require('../middlewares/verifyToken');
 const isAdmin = require('../middlewares/isAdmin');
 
-router.get('/overview',        verifyToken, isAdmin, ctrl.getOverview);
-router.get('/pageviews',       verifyToken, isAdmin, ctrl.getPageviews);
-router.get('/events',          verifyToken, isAdmin, ctrl.getEvents);
-router.get('/consent-stats',   verifyToken, isAdmin, ctrl.getConsentStats);
-router.get('/devices',         verifyToken, isAdmin, ctrl.getDevices);
-router.get('/traffic-sources', verifyToken, isAdmin, ctrl.getTrafficSources);
-router.get('/performance',     verifyToken, isAdmin, ctrl.getPerformance);
-router.get('/active-visitors', verifyToken, isAdmin, ctrl.getActiveVisitors);
+router.get('/overview',        verifyToken, isAdmin, dash, ctrl.getOverview);
+router.get('/pageviews',       verifyToken, isAdmin, dash, ctrl.getPageviews);
+router.get('/events',          verifyToken, isAdmin, dash, ctrl.getEvents);
+router.get('/consent-stats',   verifyToken, isAdmin, dash, ctrl.getConsentStats);
+router.get('/devices',         verifyToken, isAdmin, dash, ctrl.getDevices);
+router.get('/traffic-sources', verifyToken, isAdmin, dash, ctrl.getTrafficSources);
+router.get('/performance',     verifyToken, isAdmin, dash, ctrl.getPerformance);
+router.get('/active-visitors', verifyToken, isAdmin, live, ctrl.getActiveVisitors);
 
 // ─── ADMIN SALES ANALYTICS ────────────────────────────────────────────────────
-router.get('/sales-overview',  verifyToken, isAdmin, ctrl.getSalesOverview);
-router.get('/sales-trend',     verifyToken, isAdmin, ctrl.getSalesTrend);
-router.get('/top-products',    verifyToken, isAdmin, ctrl.getTopProducts);
-router.get('/category-dist',   verifyToken, isAdmin, ctrl.getCategoryDistribution);
+router.get('/sales-overview',  verifyToken, isAdmin, dash, ctrl.getSalesOverview);
+router.get('/sales-trend',     verifyToken, isAdmin, dash, ctrl.getSalesTrend);
+router.get('/top-products',    verifyToken, isAdmin, dash, ctrl.getTopProducts);
+router.get('/category-dist',   verifyToken, isAdmin, dash, ctrl.getCategoryDistribution);
 
 module.exports = router;

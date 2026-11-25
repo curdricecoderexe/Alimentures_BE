@@ -1,61 +1,60 @@
-const admin = require('../lib/firebaseAdmin');
-const db = require('../config/firebase');
+/**
+ * Team notifications — by email.
+ *
+ * The admin/staff bell used to poll a `notifications` collection, which cost
+ * thousands of Firestore reads per open tab per hour. Store updates are now
+ * emailed to the team inboxes in ORDER_ALERT_EMAILS instead (no Firestore reads
+ * or writes). Customers are informed by the order emails sent from
+ * orderController.sendOrderEmail.
+ *
+ * Existing documents in `notifications` are left untouched.
+ */
 const log = require('../lib/logger');
+const { sendMail } = require('../utils/mailer');
+const { buildTeamUpdateEmail } = require('../utils/emailTemplates');
 
-exports.getNotifications = async (req, res) => {
+const teamInboxes = () => String(process.env.ORDER_ALERT_EMAILS || '')
+  .split(',').map((e) => e.trim()).filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+
+// The same update is often raised for admin and staff at once — send it once.
+const recent = new Map(); // key -> sentAt
+const DEDUPE_MS = 60 * 1000;
+
+/**
+ * Email the shop team about a store update. Fire-and-forget; never throws.
+ * @param {string} title
+ * @param {string} message
+ * @param {object} [opts]
+ * @param {string} [opts.orderId]  adds an "Open order" button
+ */
+async function notifyTeam(title, message, { orderId } = {}) {
   try {
-    const { role, uid } = req.user;
-
-    const snapshot = await db.collection("notifications")
-      .where("target", "in", [uid, role])
-      .limit(50)
-      .get();
-
-    const notifications = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-    notifications.sort((a, b) => {
-      const ta = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt?._seconds ? a.createdAt._seconds * 1000 : 0);
-      const tb = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt?._seconds ? b.createdAt._seconds * 1000 : 0);
-      return tb - ta;
-    });
-
-    return res.status(200).json({ success: true, data: notifications });
-  } catch (error) {
-    log.error("notification.list_failed", { requestId: req.id, err: error });
-    return res.status(500).json({ success: false, error: "Failed to fetch notifications" });
-  }
-};
-
-exports.markAsRead = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const ref = db.collection("notifications").doc(id);
-    const doc = await ref.get();
-    if (!doc.exists) return res.status(404).json({ success: false, error: "Notification not found" });
-
-    const target = doc.data().target;
-    // The notification must be addressed to this user or to their role.
-    if (target !== req.user.uid && target !== req.user.role) {
-      return res.status(403).json({ success: false, error: "Forbidden" });
+    const to = teamInboxes();
+    if (!to.length) {
+      log.warn('notification.no_team_inbox', { title });
+      return;
     }
+    const key = `${title}|${message}`;
+    const now = Date.now();
+    for (const [k, at] of recent) if (now - at > DEDUPE_MS) recent.delete(k);
+    if (recent.has(key)) return;
+    recent.set(key, now);
 
-    await ref.update({ read: true });
-    return res.status(200).json({ success: true, message: "Marked as read" });
-  } catch (error) {
-    log.error("notification.mark_read_failed", { requestId: req.id, err: error });
-    return res.status(500).json({ success: false, error: "Failed to update notification" });
-  }
-};
-
-exports.createNotification = async (target, title, message) => {
-  try {
-    await db.collection("notifications").add({
-      target,
-      title,
-      message,
-      read: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    const { subject, text, html } = buildTeamUpdateEmail({ title, message, orderId });
+    await sendMail(to.join(','), subject, text, html);
   } catch (err) {
-    log.error("notification.create_failed", { target, err });
+    log.error('notification.email_failed', { title, err });
   }
+}
+
+/**
+ * Kept for existing callers: `target` 'admin' / 'staff' emails the team;
+ * a customer uid is a no-op (customers get order emails instead).
+ */
+exports.createNotification = async (target, title, message, opts = {}) => {
+  if (target === 'admin' || target === 'staff') return notifyTeam(title, message, opts);
+  return undefined;
 };
+
+exports.notifyTeam = notifyTeam;
+exports._internal = { teamInboxes, recent };

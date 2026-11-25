@@ -15,6 +15,7 @@
  */
 'use strict';
 
+const memoCache = require('../lib/memoCache');
 const db = require('../config/firebase');
 const { slugify } = require('../lib/slug');
 
@@ -35,6 +36,15 @@ const byNewest = (a, b) =>
 
 /** List-view shape: everything except the (potentially long) body. */
 const summary = ({ content, ...rest }) => rest;
+
+// Published posts power /blog and every article page. Cached in memory and
+// cleared on any write, so readers cost one Firestore query per 10 minutes.
+const PUBLIC_LIMIT = 200;
+const publishedCache = memoCache({ ttlMs: 10 * 60 * 1000 });
+const publishedPosts = () => publishedCache.get('published', async () => {
+  const snap = await db.collection(COLLECTION).where('status', '==', 'published').limit(PUBLIC_LIMIT).get();
+  return snap.docs.map((d) => ({ id: d.id, ...d.data() })).sort(byNewest);
+});
 
 async function allPosts() {
   const snap = await db.collection(COLLECTION).get();
@@ -59,16 +69,14 @@ async function clearOtherFeatured(posts, keepId) {
   const batch = db.batch();
   for (const p of others) batch.update(db.collection(COLLECTION).doc(p.id), { featured: false });
   await batch.commit();
+  publishedCache.clear();
 }
 
 // ── Public ──────────────────────────────────────────────────────────────────
 
 exports.listPublished = async (req, res) => {
   try {
-    const posts = (await allPosts())
-      .filter((p) => p.status === 'published')
-      .sort(byNewest)
-      .map(summary);
+    const posts = (await publishedPosts()).map(summary);
     return res.status(200).json({ success: true, data: posts });
   } catch (err) {
     console.error('LIST BLOG POSTS ERROR:', err);
@@ -78,10 +86,9 @@ exports.listPublished = async (req, res) => {
 
 exports.getPublishedBySlug = async (req, res) => {
   try {
-    const snap = await db.collection(COLLECTION).where('slug', '==', String(req.params.slug)).limit(1).get();
-    const doc = snap.docs[0];
-    const post = doc ? { id: doc.id, ...doc.data() } : null;
-    if (!post || post.status !== 'published') {
+    const slug = String(req.params.slug);
+    const post = (await publishedPosts()).find((p) => p.slug === slug) || null;
+    if (!post) {
       return res.status(404).json({ success: false, error: 'Article not found' });
     }
     return res.status(200).json({ success: true, data: post });
@@ -129,6 +136,7 @@ exports.createPost = async (req, res) => {
     };
 
     const ref = await db.collection(COLLECTION).add(post);
+    publishedCache.clear();
     if (post.featured) await clearOtherFeatured(posts, ref.id);
     return res.status(201).json({ success: true, data: { id: ref.id, ...post } });
   } catch (err) {
@@ -163,6 +171,7 @@ exports.updatePost = async (req, res) => {
     updates.updatedAt = nowIso();
 
     await ref.update(updates);
+    publishedCache.clear();
     if (updates.featured) await clearOtherFeatured(posts, id);
     return res.status(200).json({ success: true, data: { ...current, ...updates } });
   } catch (err) {
@@ -178,6 +187,7 @@ exports.deletePost = async (req, res) => {
     if (!existing.exists) return res.status(404).json({ success: false, error: 'Article not found' });
     if (!canModify(req.user, existing.data())) return res.status(403).json({ success: false, error: 'Forbidden' });
     await ref.delete();
+    publishedCache.clear();
     return res.status(200).json({ success: true, message: 'Article deleted' });
   } catch (err) {
     console.error('DELETE BLOG POST ERROR:', err);

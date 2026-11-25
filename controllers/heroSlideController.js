@@ -1,4 +1,6 @@
 const db = require('../config/firebase');
+const memoCache = require('../lib/memoCache');
+const listCache = memoCache({ ttlMs: 10 * 60 * 1000 }); // public list, cleared on every admin write
 const admin = require('../lib/firebaseAdmin');
 
 const WRITABLE = ['src', 'mobileSrc', 'title', 'subtitle', 'ctaText', 'ctaLink', 'order'];
@@ -11,8 +13,10 @@ const pickWritable = (body) => {
 
 exports.getSlides = async (req, res, next) => {
   try {
-    const snapshot = await db.collection('heroSlides').orderBy('createdAt', 'asc').get();
-    const slides = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const slides = await listCache.get('all', async () => {
+      const snapshot = await db.collection('heroSlides').orderBy('createdAt', 'asc').get();
+      return snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    });
     res.json({ success: true, data: slides });
   } catch (err) {
     next(err);
@@ -27,6 +31,7 @@ exports.createSlide = async (req, res, next) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     const docRef = await db.collection('heroSlides').add(slideData);
+    listCache.clear();
     res.status(201).json({ success: true, data: { id: docRef.id } });
   } catch (err) {
     next(err);
@@ -47,6 +52,7 @@ exports.updateSlide = async (req, res, next) => {
     if (!existing.exists) return res.status(404).json({ success: false, error: 'Slide not found' });
 
     await ref.update(updates);
+    listCache.clear();
     res.json({ success: true, message: 'Slide updated successfully' });
   } catch (err) {
     next(err);
@@ -60,6 +66,7 @@ exports.deleteSlide = async (req, res, next) => {
     const existing = await ref.get();
     if (!existing.exists) return res.status(404).json({ success: false, error: 'Slide not found' });
     await ref.delete();
+    listCache.clear();
     res.json({ success: true, message: 'Slide deleted successfully' });
   } catch (err) {
     next(err);

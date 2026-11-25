@@ -6,7 +6,7 @@ const { sumShards } = require('../services/analyticsService');
 // a busy site can't turn one admin page load into tens of thousands of reads.
 // When hit, the response carries `capped: true`. Real pre-aggregation is tracked
 // separately; this is the interim bound.
-const ANALYTICS_READ_CAP = 8000;
+const ANALYTICS_READ_CAP = 4000;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 

@@ -211,7 +211,6 @@ app.use(PUBLIC_CACHE_PATHS, (req, res, next) => {
 const productRoutes = require("./routes/productRoutes");
 const userRoutes = require("./routes/userRoutes");
 const orderRoutes = require("./routes/orderRoutes");
-const notificationRoutes = require("./routes/notificationRoutes");
 const chatRoutes = require("./routes/chatRoutes");
 const settingsRoutes = require("./routes/settingsRoutes");
 const superGrainsRoutes = require("./routes/superGrainsRoutes");
@@ -237,7 +236,6 @@ const hamperRoutes = require("./routes/hamperRoutes");
 app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/orders", orderRoutes);
-app.use("/api/notifications", notificationRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/super-grains", superGrainsRoutes);

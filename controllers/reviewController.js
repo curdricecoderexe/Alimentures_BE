@@ -31,6 +31,7 @@ const recomputeProductAggregate = async (productId) => {
     snap.forEach((doc) => { total += Number(doc.data().rating) || 0; count++; });
     const averageRating = count > 0 ? Number((total / count).toFixed(1)) : 0;
     await db.collection("products").doc(productId).update({ averageRating, reviewCount: count });
+    require('./productController').invalidateProductCache(); // new rating shows straight away
   } catch (err) {
     console.error("Failed to recompute product aggregate for", productId, err);
   }

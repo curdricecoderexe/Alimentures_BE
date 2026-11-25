@@ -81,7 +81,8 @@ exports.createEnquiry = async (req, res) => {
 // GET /api/hampers/enquiries — admin
 exports.listEnquiries = async (req, res) => {
   try {
-    const snap = await db.collection(COLLECTION).get();
+    // Newest 200 — older enquiries stay in Firestore but aren't listed.
+    const snap = await db.collection(COLLECTION).orderBy('createdAt', 'desc').limit(200).get();
     const data = snap.docs.map((d) => ({ id: d.id, ...d.data() }))
       .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
     res.set('Cache-Control', 'private, no-store');

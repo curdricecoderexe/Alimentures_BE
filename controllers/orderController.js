@@ -23,6 +23,15 @@ const {
 const log = require('../lib/logger');
 const { runOrdered } = require('../lib/resilientQuery');
 
+// Every order transaction can move stock (reserve, release, cancel, refund), so
+// drop the product cache afterwards — the storefront then shows fresh stock
+// without polling Firestore every minute. Lazy require avoids a load cycle.
+const runStockTxn = async (fn) => {
+  const result = await db.runTransaction(fn);
+  require('./productController').invalidateProductCache();
+  return result;
+};
+
 const LIST_LIMIT_MAX = LIMITS.LIST_LIMIT_MAX;
 
 const couponRedemptionId = (couponId, uid) => `${couponId}_${uid}`;
@@ -177,7 +186,7 @@ async function confirmCouponInTxn(t, oData) {
 async function releaseCoupon(couponId, uid) {
   if (!couponId || !uid) return;
   try {
-    await db.runTransaction(async (t) => {
+    await runStockTxn(async (t) => {
       const redemptionRef = db.collection('couponRedemptions').doc(couponRedemptionId(couponId, uid));
       const couponRef = db.collection('coupons').doc(couponId);
       const [rSnap, cSnap] = await Promise.all([t.get(redemptionRef), t.get(couponRef)]);
@@ -259,7 +268,7 @@ function applyOrderReversal(t, oData, rev) {
 
 const releaseReservation = async (reservationId, status = 'RELEASED') => {
   try {
-    await db.runTransaction(async (t) => {
+    await runStockTxn(async (t) => {
       const resRef = db.collection("stockReservations").doc(reservationId);
       const resDoc = await t.get(resRef);
       if (!resDoc.exists) return;
@@ -657,7 +666,7 @@ exports.createOrder = async (req, res) => {
     }
 
     // ── 3. Transaction: stock, coupon (COD only), order/reservation ──
-    const txResult = await db.runTransaction(async (t) => {
+    const txResult = await runStockTxn(async (t) => {
       // reads
       const idempRef = idempotencyKey ? db.collection('idempotencyKeys').doc(idempotencyKey) : null;
       if (idempRef) {
@@ -923,7 +932,7 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
     log.warn('order.payment_fetch_failed', { orderId, err: e });
   }
 
-  await db.runTransaction(async (t) => {
+  await runStockTxn(async (t) => {
     const oDoc = await t.get(orderRef);
     if (!oDoc.exists || oDoc.data().status !== "payment_pending") return;
     const oData = oDoc.data();
@@ -964,12 +973,7 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
   const short = `#${orderId.slice(-6).toUpperCase()}`;
   sendOrderEmail(orderId, 'paid');
   alertTeamOfPaidOrder(orderId);
-  ['admin', 'staff'].forEach((target) => {
-    createNotification(target, 'New Paid Order', `Paid order ${short} received via Razorpay${source === 'webhook' ? ' (webhook)' : ''}`);
-  });
-  if (confirmedData.userId) {
-    createNotification(confirmedData.userId, 'Payment Successful', `Your order ${short} has been confirmed.`);
-  }
+  // The team is emailed the full order by alertTeamOfPaidOrder above.
   log.info('order.razorpay_confirmed', { orderId, source });
 }
 
@@ -1012,7 +1016,7 @@ async function reconcileDashboardRefund(entity) {
   const orderRef = snap.docs[0].ref;
 
   let reconciled = false;
-  await db.runTransaction(async (t) => {
+  await runStockTxn(async (t) => {
     const oDoc = await t.get(orderRef);
     if (!oDoc.exists) return;
     const oData = oDoc.data();
@@ -1039,7 +1043,7 @@ async function reconcileDashboardRefund(entity) {
   const short = `#${orderRef.id.slice(-6).toUpperCase()}`;
   const fresh = (await orderRef.get()).data();
   sendOrderEmail(orderRef.id, 'refunded', { refundAmount: amountRupees || Number(fresh?.totalAmount) || 0 });
-  if (fresh?.userId) createNotification(fresh.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
+  createNotification('admin', 'Refund Processed', `Refund for order ${short} was processed (Razorpay webhook).`, { orderId: orderRef.id });
 }
 
 exports.razorpayWebhook = async (req, res) => {
@@ -1125,7 +1129,7 @@ exports.updateOrderStatus = async (req, res) => {
     const docRef = db.collection("orders").doc(id);
     let existingData;
 
-    await db.runTransaction(async (t) => {
+    await runStockTxn(async (t) => {
       const oDoc = await t.get(docRef);
       if (!oDoc.exists) throw new Error("NOT_FOUND");
       const oData = oDoc.data();
@@ -1163,12 +1167,7 @@ exports.updateOrderStatus = async (req, res) => {
     }
 
     sendOrderEmail(id, 'status', { status });
-    ['admin', 'staff'].forEach((target) => {
-      createNotification(target, 'Order Status Updated', `Order #${id.slice(-6).toUpperCase()} is now ${status.replace(/_/g, ' ')}`);
-    });
-    if (existingData.userId) {
-      createNotification(existingData.userId, 'Order Update', `Your order #${id.slice(-6).toUpperCase()} is now ${status.replace(/_/g, ' ')}`);
-    }
+    createNotification('admin', 'Order Status Updated', `Order #${id.slice(-6).toUpperCase()} is now ${status.replace(/_/g, ' ')}`, { orderId: id });
 
     return res.status(200).json({ success: true, message: "Order status updated" });
   } catch (err) {
@@ -1257,7 +1256,7 @@ exports.refundOrder = async (req, res) => {
 
     // 3. Persist state atomically
     let existingData;
-    await db.runTransaction(async (t) => {
+    await runStockTxn(async (t) => {
       const oDoc = await t.get(docRef);
       if (!oDoc.exists) throw new Error("NOT_FOUND");
       const oData = oDoc.data();
@@ -1292,7 +1291,7 @@ exports.refundOrder = async (req, res) => {
     const short = `#${id.slice(-6).toUpperCase()}`;
     sendOrderEmail(id, 'refunded', { refundAmount: requested });
     if (existingData.userId) {
-      createNotification(existingData.userId, 'Refund Processed', `Your refund for order ${short} is on its way.`);
+      createNotification('admin', 'Refund Processed', `Refund for order ${short} was processed.`, { orderId: id });
     }
 
     // Stop the parcel (and release the wallet freight hold) if the courier hasn't picked it up.
@@ -1300,7 +1299,7 @@ exports.refundOrder = async (req, res) => {
       ? await cancelShipmentForOrder(id, { reason: 'refund' })
       : 'not_needed';
     if (shipmentCancel === 'failed') {
-      createNotification('admin', 'Cancel shipment manually', `Order ${short} was refunded but its Shiprocket shipment could not be cancelled. Cancel it in the Shiprocket panel.`);
+      createNotification('admin', 'Cancel shipment manually', `Order ${short} was refunded but its Shiprocket shipment could not be cancelled. Cancel it in the Shiprocket panel.`, { orderId: id });
     }
     return res.status(200).json({ success: true, message: "Refund processed", refundId: refund?.id || null, shipmentCancel });
   } catch (err) {

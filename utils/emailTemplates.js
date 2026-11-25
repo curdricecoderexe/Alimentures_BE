@@ -636,4 +636,39 @@ function buildAdminOrderAlert({ order, orderId }) {
   };
 }
 
-module.exports = { buildOrderEmail, buildAdminOrderAlert, buildOtpEmail, buildWelcomeEmail, emailShell, BRAND, money, shortId, fmtDate, SITE_URL };
+/* ── team update (replaces the admin/staff in-app bell) ─────────────── */
+
+/**
+ * Short operational email for the shop team: order status changes, courier
+ * exceptions, failed Shiprocket pushes, etc.
+ * @param {object} opts
+ * @param {string} opts.title    e.g. "Order Status Updated"
+ * @param {string} opts.message  one line of plain text
+ * @param {string} [opts.orderId] adds an "Open in admin" button
+ */
+function buildTeamUpdateEmail({ title, message, orderId }) {
+  const adminUrl = orderId
+    ? `${SITE_URL}/admin/orders?orderId=${encodeURIComponent(orderId)}`
+    : `${SITE_URL}/admin`;
+  const content = `
+        <tr><td class="px" style="padding:22px 30px 6px">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${BRAND.line};border-radius:14px;background:#fff"><tr>
+            <td style="padding:16px 18px;font:600 14px/1.6 ${BODY};color:${BRAND.ink}">${esc(message)}</td>
+          </tr></table>
+        </td></tr>`;
+  return {
+    subject: `[Alimenture] ${title}`,
+    text: `${title}\n\n${message}\n\nOpen the admin panel: ${adminUrl}`,
+    html: emailShell({
+      preheader: message,
+      icon: '🔔',
+      eyebrow: 'Store update',
+      heading: title,
+      cta: { href: adminUrl, label: orderId ? 'Open order' : 'Open admin' },
+      content,
+      note: 'Automatic update from your Alimenture store. Sent to ORDER_ALERT_EMAILS.',
+    }),
+  };
+}
+
+module.exports = { buildOrderEmail, buildAdminOrderAlert, buildOtpEmail, buildWelcomeEmail, buildTeamUpdateEmail, emailShell, BRAND, money, shortId, fmtDate, SITE_URL };

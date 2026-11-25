@@ -1,14 +1,23 @@
 const db = require("../config/firebase");
 const log = require("../lib/logger");
 const { createAuditLog } = require("../services/auditService");
+const memoCache = require("../lib/memoCache");
+
+// Read on every storefront page load; changes only when an admin saves.
+const settingsCache = memoCache({ ttlMs: 10 * 60 * 1000 });
+const loadSettings = () => settingsCache.get('storefront', async () => {
+  const doc = await db.collection("settings").doc("storefront").get();
+  return doc.exists ? doc.data() : null;
+});
+exports.clearSettingsCache = () => settingsCache.clear();
 
 exports.getSettings = async (req, res) => {
   try {
-    const doc = await db.collection("settings").doc("storefront").get();
-    if (!doc.exists) {
+    const data = await loadSettings();
+    if (!data) {
       return res.status(200).json({ success: true, data: { newArrivalPoster: null } });
     }
-    return res.status(200).json({ success: true, data: doc.data() });
+    return res.status(200).json({ success: true, data });
   } catch (error) {
     log.error("settings.get_failed", { requestId: req.id, err: error });
     return res.status(500).json({ success: false, error: "Failed to fetch settings" });
@@ -23,6 +32,7 @@ exports.updateSettings = async (req, res) => {
       newArrivalPoster: newArrivalPoster || null,
       updatedAt: new Date().toISOString(),
     }, { merge: true });
+    settingsCache.clear();
 
     createAuditLog({
       adminId: req.user?.uid,
@@ -79,6 +89,7 @@ exports.updateCommitment = async (req, res) => {
       commitment,
       updatedAt: new Date().toISOString(),
     }, { merge: true });
+    settingsCache.clear();
 
     createAuditLog({
       adminId: req.user?.uid,
@@ -113,6 +124,7 @@ exports.updateHampersVisibility = async (req, res) => {
       hampersVisible: visible,
       updatedAt: new Date().toISOString(),
     }, { merge: true });
+    settingsCache.clear();
 
     createAuditLog({
       adminId: req.user?.uid,
@@ -160,6 +172,7 @@ exports.updateSocialLinks = async (req, res) => {
       socialLinks,
       updatedAt: new Date().toISOString(),
     }, { merge: true });
+    settingsCache.clear();
 
     createAuditLog({
       adminId: req.user?.uid,
