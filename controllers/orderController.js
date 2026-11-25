@@ -836,7 +836,9 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ success: false, error: err.message });
     }
     log.error("order.create_failed", { requestId: req.id, err });
-    return res.status(500).json({ success: false, error: "Failed to place order" });
+    // Outside production, surface the real cause so it shows in the checkout toast.
+    const detail = process.env.NODE_ENV !== 'production' && err?.message ? ` (${err.message})` : '';
+    return res.status(500).json({ success: false, error: `Failed to place order${detail}` });
   }
 };
 

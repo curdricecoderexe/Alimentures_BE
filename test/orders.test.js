@@ -60,6 +60,26 @@ test('createOrder prices from the database, reserves stock and opens a Razorpay 
   assert.equal(reservation.orderId, res.body.orderId);
 });
 
+test('createOrder applies a coupon to the subtotal only (never the delivery fee)', async () => {
+  db.seed('coupons/w1', {
+    code: 'WELCOME10-ABCDEF', kind: 'welcome', assignedTo: USER.uid, discountType: 'percentage', discountValue: 10,
+    minOrderValue: 0, maxUsage: 1, usedCount: 0, isActive: true, expiresAt: null,
+  });
+  const res = await placeOrder({
+    couponCode: 'welcome10-abcdef',
+    items: [{ productId: 'cookie', selectedWeight: '120g', quantity: 3 }],
+  });
+
+  assert.equal(res.statusCode, 201, JSON.stringify(res.body));
+  const order = db.read(`orders/${res.body.orderId}`);
+  assert.equal(order.subtotal, 270);
+  assert.equal(order.discountAmount, 27, '10% of the subtotal, not of subtotal + delivery');
+  assert.equal(order.totalAmount, 270 + order.deliveryFee - 27);
+  assert.equal(razorpayCalls.ordersCreated[0].amount, order.totalAmount * 100);
+  const redemption = db.read(`couponRedemptions/w1_${USER.uid}`);
+  assert.equal(redemption.pending, true, 'provisional until the payment is captured');
+});
+
 test('createOrder snapshots packed weight + size onto order items for the parcel', async () => {
   const res = await placeOrder({ items: [
     { productId: 'cookie', selectedWeight: '120g', quantity: 1 },
