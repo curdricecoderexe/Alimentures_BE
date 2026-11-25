@@ -184,6 +184,10 @@ const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: Number(process.env.GLOBAL_RATE_MAX) || 1000,
   message: { success: false, error: "Too many requests from this IP, please try again later." },
+  // Analytics beacons (one per click/page) have their own per-minute + daily
+  // limiters (routes/analyticsRoutes.js). Counting them here let an active
+  // shopper exhaust the budget and get 429s on the catalogue itself.
+  skip: (req) => req.method === 'POST' && req.path.startsWith('/analytics/'),
   // Don't advertise the limit/remaining budget; a 429 still carries Retry-After.
   standardHeaders: false,
   legacyHeaders: false,
