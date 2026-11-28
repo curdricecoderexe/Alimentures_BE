@@ -151,31 +151,91 @@ async function consumeCouponInTxn(t, { couponRef, uid, subtotal, pending = false
 }
 
 /**
- * Finalise a coupon redemption once a Razorpay order is PAID. The redemption was
- * already created (provisionally) inside the order transaction, so this just
- * clears the `pending` flag. Idempotent; tolerates a missing redemption doc.
+ * Finalise a coupon redemption once a Razorpay order is PAID — split into a READ
+ * and a WRITE half because Firestore transactions must do every read before the
+ * first write (the SDK throws otherwise). The redemption was normally created
+ * (provisionally) with the order, so this just clears `pending`; if it was
+ * released meanwhile (abandoned/expired checkout that was paid late) it is
+ * recorded again. Tolerates a deleted coupon.
  */
-async function confirmCouponInTxn(t, oData) {
-  if (!oData.couponId || !oData.userId) return;
+async function readCouponConfirm(t, oData) {
+  if (!oData.couponId || !oData.userId) return null;
   const redemptionRef = db.collection('couponRedemptions').doc(couponRedemptionId(oData.couponId, oData.userId));
-  const snap = await t.get(redemptionRef);
-  if (snap.exists) {
-    if (snap.data().pending) {
-      t.update(redemptionRef, { pending: false, confirmedAt: admin.firestore.FieldValue.serverTimestamp() });
+  const couponRef = db.collection('coupons').doc(oData.couponId);
+  const [rSnap, cSnap] = await Promise.all([t.get(redemptionRef), t.get(couponRef)]);
+  return {
+    oData, redemptionRef, couponRef,
+    redemptionExists: rSnap.exists,
+    redemptionPending: rSnap.exists && !!rSnap.data().pending,
+    couponExists: cSnap.exists,
+  };
+}
+
+function applyCouponConfirm(t, c) {
+  if (!c) return;
+  if (c.redemptionExists) {
+    if (c.redemptionPending) {
+      t.update(c.redemptionRef, { pending: false, confirmedAt: admin.firestore.FieldValue.serverTimestamp() });
     }
     return;
   }
-  // Fallback (shouldn't happen with the new flow): record it now.
-  t.create(redemptionRef, {
-    couponId: oData.couponId,
-    code: oData.couponCode || null,
-    userId: oData.userId,
+  t.create(c.redemptionRef, {
+    couponId: c.oData.couponId,
+    code: c.oData.couponCode || null,
+    userId: c.oData.userId,
     pending: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
-  t.update(db.collection('coupons').doc(oData.couponId), {
-    usedCount: admin.firestore.FieldValue.increment(1),
-  });
+  if (c.couponExists) {
+    t.update(c.couponRef, { usedCount: admin.firestore.FieldValue.increment(1) });
+  }
+}
+
+/**
+ * An order the system cancelled only because its payment window lapsed (customer
+ * closed the Razorpay window, or the 10-minute reservation expired). If Razorpay
+ * then captures a payment for it — slow UPI/netbanking — it must be revived, not
+ * left cancelled with the customer's money taken.
+ */
+const LATE_PAYMENT_CANCEL_REASONS = ['payment_window_expired', 'reservation_released'];
+const isRevivableCancelledOrder = (o) => !!o
+  && o.status === 'cancelled'
+  && !o.razorpayPaymentId
+  && LATE_PAYMENT_CANCEL_REASONS.includes(o.cancelReason);
+
+/**
+ * Read (inside a txn) whether every line of an order can be taken from stock
+ * again. Variants are tracked per product so two lines of the same product
+ * (different sizes) are both counted.
+ */
+async function readRestock(t, items = []) {
+  const byProduct = new Map(); // productId -> { ref, variants, qty }
+  for (const item of items) {
+    if (!byProduct.has(item.productId)) {
+      const ref = db.collection('products').doc(item.productId);
+      const snap = await t.get(ref);
+      byProduct.set(item.productId, { ref, exists: snap.exists, variants: snap.exists ? (snap.data().variants || []).map((v) => ({ ...v })) : [], qty: 0 });
+    }
+  }
+  let available = true;
+  for (const item of items) {
+    const p = byProduct.get(item.productId);
+    if (!p.exists) { available = false; continue; }
+    let idx = p.variants.findIndex((v) => v.weight === item.selectedWeight);
+    if (idx === -1 && (item.selectedWeight === 'Standard' || !item.selectedWeight) && p.variants.length > 0) idx = 0;
+    const qty = Number(item.quantity) || 0;
+    if (idx === -1 || Number(p.variants[idx].stock) < qty) { available = false; continue; }
+    p.variants[idx].stock = Number(p.variants[idx].stock) - qty;
+    p.qty += qty;
+  }
+  return { available, byProduct };
+}
+
+function applyRestockTake(t, restock) {
+  for (const [, p] of restock.byProduct) {
+    if (!p.exists || !p.qty) continue;
+    t.update(p.ref, { variants: p.variants, stock: admin.firestore.FieldValue.increment(-p.qty) });
+  }
 }
 
 /**
@@ -212,20 +272,24 @@ async function releaseCoupon(couponId, uid) {
  */
 async function readOrderReversal(t, oData) {
   const productUpdates = new Map();
+  const missing = new Set();
   for (const item of oData.items || []) {
-    const productRef = db.collection("products").doc(item.productId);
-    const productDoc = await t.get(productRef);
-    if (!productDoc.exists) continue;
-    const variants = productDoc.data().variants || [];
+    if (missing.has(item.productId)) continue;
+    // One read per product; later lines of the same product reuse that copy.
+    let entry = productUpdates.get(item.productId);
+    if (!entry) {
+      const productRef = db.collection("products").doc(item.productId);
+      const productDoc = await t.get(productRef);
+      if (!productDoc.exists) { missing.add(item.productId); continue; }
+      entry = { ref: productRef, variants: productDoc.data().variants || [], quantityChange: 0 };
+    }
+    const { variants } = entry;
     let idx = variants.findIndex((v) => v.weight === item.selectedWeight);
     if (idx === -1 && (item.selectedWeight === 'Standard' || !item.selectedWeight) && variants.length > 0) idx = 0;
     if (idx === -1) continue;
     variants[idx].stock = Number(variants[idx].stock) + Number(item.quantity);
-    productUpdates.set(item.productId, {
-      ref: productRef,
-      variants,
-      quantityChange: (productUpdates.get(item.productId)?.quantityChange || 0) + Number(item.quantity),
-    });
+    entry.quantityChange += Number(item.quantity);
+    productUpdates.set(item.productId, entry);
   }
 
   let coupon = null;
@@ -300,25 +364,24 @@ const releaseReservation = async (reservationId, status = 'RELEASED') => {
       }
 
       const productUpdates = new Map();
+      const snaps = new Map(); // one read per product (later lines reuse the copy)
       for (const item of data.items || []) {
-        const productRef = db.collection("products").doc(item.productId);
-        const productDoc = await t.get(productRef);
-        if (productDoc.exists) {
-          const productData = productDoc.data();
-          let variants = productData.variants || [];
-          let variantIndex = variants.findIndex(v => v.weight === item.selectedWeight);
-          if (variantIndex === -1 && (item.selectedWeight === 'Standard' || !item.selectedWeight)) {
-            if (variants.length > 0) variantIndex = 0;
-          }
-          if (variantIndex !== -1) {
-            variants[variantIndex].stock = Number(variants[variantIndex].stock) + Number(item.quantity);
-            productUpdates.set(item.productId, {
-              ref: productRef,
-              variants: variants,
-              quantityChange: (productUpdates.get(item.productId)?.quantityChange || 0) + Number(item.quantity)
-            });
-          }
+        if (!snaps.has(item.productId)) {
+          const productRef = db.collection("products").doc(item.productId);
+          const productDoc = await t.get(productRef);
+          snaps.set(item.productId, productDoc.exists ? { ref: productRef, variants: productDoc.data().variants || [] } : null);
         }
+        const p = snaps.get(item.productId);
+        if (!p) continue;
+        let variantIndex = p.variants.findIndex(v => v.weight === item.selectedWeight);
+        if (variantIndex === -1 && (item.selectedWeight === 'Standard' || !item.selectedWeight) && p.variants.length > 0) variantIndex = 0;
+        if (variantIndex === -1) continue;
+        p.variants[variantIndex].stock = Number(p.variants[variantIndex].stock) + Number(item.quantity);
+        productUpdates.set(item.productId, {
+          ref: p.ref,
+          variants: p.variants,
+          quantityChange: (productUpdates.get(item.productId)?.quantityChange || 0) + Number(item.quantity),
+        });
       }
 
       // ── ALL WRITES ──
@@ -351,14 +414,28 @@ const releaseReservation = async (reservationId, status = 'RELEASED') => {
 
 exports.cleanupExpiredReservations = async (req, res) => {
   try {
-    const snapshot = await db.collection("stockReservations")
-      .where("status", "==", "ACTIVE")
-      .where("expiresAt", "<", new Date())
-      .limit(250) // bounded per run; the cron fires every 5 min
-      .get();
+    const now = new Date();
+    let docs;
+    try {
+      const snapshot = await db.collection("stockReservations")
+        .where("status", "==", "ACTIVE")
+        .where("expiresAt", "<", now)
+        .limit(250) // bounded per run; the cron fires every 5 min
+        .get();
+      docs = snapshot.docs;
+    } catch (err) {
+      // Composite index (status + expiresAt, see firestore.indexes.json) not
+      // deployed yet → without this fallback the cleanup silently never ran, so
+      // abandoned checkouts kept stock locked forever.
+      if (err.code !== 9) throw err;
+      log.warn('cron.reservation_cleanup_index_missing');
+      const snapshot = await db.collection("stockReservations").where("status", "==", "ACTIVE").limit(1000).get();
+      const ms = (v) => (v?.toDate ? v.toDate() : new Date(v)).getTime();
+      docs = snapshot.docs.filter((d) => d.data().expiresAt && ms(d.data().expiresAt) < now.getTime()).slice(0, 250);
+    }
 
     let count = 0;
-    for (const doc of snapshot.docs) {
+    for (const doc of docs) {
       const { orderId } = doc.data();
       if (orderId) {
         const oDoc = await db.collection("orders").doc(orderId).get();
@@ -370,6 +447,7 @@ exports.cleanupExpiredReservations = async (req, res) => {
 
     if (res) return res.status(200).json({ success: true, message: `Cleaned up ${count} expired reservations`, hasMore: count === 250 });
   } catch (err) {
+    log.error('cron.reservation_cleanup_failed', { err });
     if (res) return res.status(500).json({ success: false, error: "Cleanup failed" });
   }
 };
@@ -409,6 +487,20 @@ exports.getOrders = async (req, res) => {
       orderField: 'createdAt', dir: 'desc', limit, requestId: req.id,
     });
     const orders = docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Self-heal the dashboard: an order still shown "awaiting payment" (or
+    // auto-cancelled in the last few days) may have been paid in Razorpay while
+    // the verify call / webhook was lost. Check a bounded number per load.
+    const toCheck = orders
+      .map((o, i) => ({ o, i }))
+      .filter(({ o }) => o.razorpayOrderId && (o.status === 'payment_pending' || recentlyCancelledUnpaid(o)))
+      .slice(0, 10);
+    await mapLimit(toCheck, 4, async ({ o, i }) => {
+      if (await reconcileRazorpayOrder(o.id, o, { includeCancelled: true })) {
+        const fresh = await db.collection('orders').doc(o.id).get();
+        if (fresh.exists) orders[i] = { id: o.id, ...fresh.data() };
+      }
+    });
 
     return res.status(200).json({
       success: true,
@@ -547,6 +639,16 @@ function sanitizeCustomerInfo(ci = {}, sessionEmail) {
   return out;
 }
 
+/** Short public URL for a product's main photo (never the inline base64 data). */
+function orderItemImageUrl(req, productId, product) {
+  // Lazy require: productController requires this module's dependencies (load cycle).
+  const { publicImageUrl } = require('./productController');
+  const host = typeof req.get === 'function' ? req.get('host') : null;
+  const base = (process.env.API_PUBLIC_URL || (host ? `${req.protocol || 'https'}://${host}` : '')).replace(/\/+$/, '');
+  const url = publicImageUrl(base, productId, product, 'main');
+  return typeof url === 'string' && !url.startsWith('data:') ? url : '';
+}
+
 exports.createOrder = async (req, res) => {
   try {
     const { items, couponCode } = req.body;
@@ -556,8 +658,18 @@ exports.createOrder = async (req, res) => {
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, error: "Cart is empty" });
     }
-    if (!customerInfo.firstName || !customerInfo.address || !customerInfo.city) {
-      return res.status(400).json({ success: false, error: "Shipping name, address and city are required" });
+    if (!customerInfo.firstName || !customerInfo.address || !customerInfo.city || !customerInfo.state) {
+      return res.status(400).json({ success: false, code: 'ADDRESS_INCOMPLETE', error: "Please fill in your name, address, city and state." });
+    }
+    // The courier needs a reachable Indian mobile and a valid PIN — without them a
+    // paid order could never be shipped.
+    const mobile = String(customerInfo.phone || '').replace(/\D/g, '').replace(/^(91|0)(?=\d{10}$)/, '');
+    if (!/^[6-9]\d{9}$/.test(mobile)) {
+      return res.status(400).json({ success: false, code: 'PHONE_INVALID', error: "Please enter a valid 10-digit mobile number so the courier can reach you." });
+    }
+    customerInfo.phone = mobile;
+    if (!isValidPincode(customerInfo.pincode)) {
+      return res.status(400).json({ success: false, code: 'PINCODE_INVALID', error: "Please enter a valid 6-digit PIN code." });
     }
 
     const idempotencyKey = req.headers['idempotency-key'] || null;
@@ -601,7 +713,10 @@ exports.createOrder = async (req, res) => {
         quantity: qty,
         name: product.name || product.title || 'Product',
         price: unitPrice,
-        image: product.image || '',
+        // Product photos are stored inline as base64 (50–200 KB each). Copying them
+        // into every line pushed multi-product carts past Firestore's 1 MB document
+        // limit, so orders/reservations keep the short cacheable image URL instead.
+        image: orderItemImageUrl(req, item.productId, product),
         category: product.category || 'General',
         // Packed weight / size snapshot so the parcel matches what was sold.
         ...variantShipping(variants[vi]),
@@ -652,17 +767,20 @@ exports.createOrder = async (req, res) => {
 
     // ── 2. Resolve the coupon by code (existence/active/expiry/min gate here;
     //       the authoritative consume + per-user + usage-limit check is in the txn) ──
+    // A coupon the customer saw applied but that no longer qualifies must NOT be
+    // dropped silently (Razorpay would then charge more than the checkout showed).
     let couponRef = null;
-    if (couponCode && typeof couponCode === 'string') {
+    if (couponCode && typeof couponCode === 'string' && couponCode.trim()) {
       const snap = await db.collection("coupons").where("code", "==", couponCode.toUpperCase().trim()).limit(1).get();
-      if (!snap.empty) {
-        const c = snap.docs[0].data();
-        const isExpired = c.expiresAt && new Date(c.expiresAt.toDate ? c.expiresAt.toDate() : c.expiresAt) < new Date();
-        const meetsMin = calculatedSubtotal >= (c.minOrderValue || 0);
-        if (c.isActive && !isExpired && meetsMin) {
-          couponRef = snap.docs[0].ref;
-        }
+      const c = snap.empty ? null : snap.docs[0].data();
+      const isExpired = c && c.expiresAt && new Date(c.expiresAt.toDate ? c.expiresAt.toDate() : c.expiresAt) < new Date();
+      if (!c || !c.isActive || isExpired) {
+        return res.status(400).json({ success: false, code: 'COUPON_INVALID', error: "This coupon is no longer valid. Remove it to continue." });
       }
+      if (calculatedSubtotal < (c.minOrderValue || 0)) {
+        return res.status(400).json({ success: false, code: 'COUPON_MIN_ORDER', error: `This coupon needs a minimum order of ₹${c.minOrderValue}. Add more items or remove the coupon.` });
+      }
+      couponRef = snap.docs[0].ref;
     }
 
     // ── 3. Transaction: stock, coupon (COD only), order/reservation ──
@@ -674,23 +792,34 @@ exports.createOrder = async (req, res) => {
         if (existing.exists) throw new Error("DUPLICATE_CHECKOUT");
       }
 
+      // Read each product ONCE and keep working on that copy, so two lines of the
+      // same product (different sizes, or a duplicated line) are both deducted —
+      // re-reading would hand back the original stock and lose the first deduction.
       const productUpdates = new Map();
       for (const item of sanitizedItems) {
-        const productRef = db.collection("products").doc(item.productId);
-        const productDoc = await t.get(productRef);
-        if (!productDoc.exists) throw new Error(`Product ${item.productId} not found`);
-        const variants = productDoc.data().variants || [];
+        let entry = productUpdates.get(item.productId);
+        if (!entry) {
+          const productRef = db.collection("products").doc(item.productId);
+          const productDoc = await t.get(productRef);
+          if (!productDoc.exists) throw new Error(`Product ${item.productId} not found`);
+          entry = { ref: productRef, variants: (productDoc.data().variants || []).map((v) => ({ ...v })), quantityChange: 0 };
+          productUpdates.set(item.productId, entry);
+        }
+        const { variants } = entry;
         let vi = variants.findIndex(v => v.weight === item.selectedWeight);
         if (vi === -1 && (item.selectedWeight === 'Standard' || !item.selectedWeight) && variants.length > 0) vi = 0;
         if (vi === -1) throw new Error(`Variant "${item.selectedWeight || 'Default'}" not found for ${item.name}`);
         const qty = Number(item.quantity);
-        if (variants[vi].stock < qty) throw new Error(`Insufficient stock for ${item.name} (${variants[vi].weight})`);
-        variants[vi] = { ...variants[vi], stock: Number(variants[vi].stock) - qty };
-        productUpdates.set(item.productId, {
-          ref: productRef,
-          variants,
-          quantityChange: (productUpdates.get(item.productId)?.quantityChange || 0) + qty,
-        });
+        const left = Math.max(0, Number(variants[vi].stock) || 0);
+        if (left < qty) {
+          throw Object.assign(new Error('OUT_OF_STOCK'), {
+            publicMessage: left > 0
+              ? `Only ${left} left of ${item.name} (${variants[vi].weight}). Please reduce the quantity.`
+              : `${item.name} (${variants[vi].weight}) just sold out. Please remove it from your cart.`,
+          });
+        }
+        variants[vi].stock = left - qty;
+        entry.quantityChange += qty;
       }
 
       // Consume the coupon inside the transaction so concurrent checkouts can't
@@ -776,10 +905,15 @@ exports.createOrder = async (req, res) => {
     // ── 4. Create the Razorpay gateway order + persist ──
     const { reservationId, totalAmount } = txResult;
     try {
+      // Reserve our order ID first and stamp it on the Razorpay order (notes +
+      // receipt), so a webhook or an admin can always match a payment back to
+      // this order — even when the razorpayOrderId lookup misses.
+      const newOrderRef = db.collection("orders").doc();
       const rzpOrder = await razorpay.orders.create({
         amount: Math.round(totalAmount * 100),
         currency: "INR",
-        receipt: `rcpt_${Date.now()}`,
+        receipt: `rcpt_${newOrderRef.id}`.slice(0, 40),
+        notes: { orderId: newOrderRef.id },
       });
 
       const orderData = {
@@ -788,7 +922,7 @@ exports.createOrder = async (req, res) => {
         razorpayOrderId: rzpOrder.id,
         reservationId,
       };
-      const newOrderRef = await db.collection("orders").add(orderData);
+      await newOrderRef.set(orderData);
       await db.collection("stockReservations").doc(reservationId).update({
         orderId: newOrderRef.id,
         razorpayOrderId: rzpOrder.id,
@@ -815,30 +949,37 @@ exports.createOrder = async (req, res) => {
       await releaseReservation(reservationId, 'RELEASED');
       await releaseCoupon(txResult.couponId, uid); // free the provisional redemption
       log.error('order.razorpay_init_failed', { requestId: req.id, err: rzpErr });
-      return res.status(502).json({ success: false, error: "Failed to initialize payment gateway" });
+      return res.status(502).json({ success: false, code: 'PAYMENT_GATEWAY_DOWN', error: "Our payment partner isn't responding right now. You have not been charged — please try again in a minute." });
     }
   } catch (err) {
+    const ref = String(req.id || '').slice(0, 8).toUpperCase();
+    const fail = (status, code, error) => res.status(status).json({ success: false, code, error, ...(ref ? { ref } : {}) });
     const map = {
-      DUPLICATE_CHECKOUT: [409, "Duplicate checkout request detected"],
-      COUPON_INVALID: [400, "Coupon is not valid for this order"],
-      COUPON_LIMIT: [400, "This coupon has reached its usage limit"],
-      COUPON_ALREADY_USED: [400, "You have already used this coupon"],
+      DUPLICATE_CHECKOUT: [409, "This order is already being placed — please wait a moment."],
+      COUPON_INVALID: [400, "This coupon can't be used on this order. Remove it to continue."],
+      COUPON_LIMIT: [400, "This coupon has reached its usage limit. Remove it to continue."],
+      COUPON_ALREADY_USED: [400, "You've already used this coupon. Remove it to continue."],
     };
     if (map[err.message]) {
       const [status, message] = map[err.message];
-      return res.status(status).json({ success: false, error: message });
+      return fail(status, err.message, message);
     }
+    if (err.message === 'OUT_OF_STOCK') return fail(409, 'OUT_OF_STOCK', err.publicMessage);
     // t.create() on an existing idempotency key (concurrent duplicate)
     if (err.code === 6 || /ALREADY_EXISTS/i.test(err.message || '')) {
-      return res.status(409).json({ success: false, error: "Duplicate checkout request detected" });
+      return fail(409, 'DUPLICATE_CHECKOUT', "This order is already being placed — please wait a moment.");
     }
-    if (/Insufficient stock|not available|not found|Invalid quantity|Variant /.test(err.message || '')) {
-      return res.status(400).json({ success: false, error: err.message });
+    if (/^(Product .* not found|Variant .* not found)/.test(err.message || '')) {
+      return fail(409, 'CART_CHANGED', "An item in your cart changed or is no longer available. Please review your cart and try again.");
     }
     log.error("order.create_failed", { requestId: req.id, err });
+    // Firestore busy / temporarily unreachable (ABORTED, DEADLINE_EXCEEDED, UNAVAILABLE, RESOURCE_EXHAUSTED).
+    if ([4, 8, 10, 14].includes(err.code)) {
+      return fail(503, 'TEMPORARILY_BUSY', "We're a little busy right now. Please try again in a few seconds — you have not been charged.");
+    }
     // Outside production, surface the real cause so it shows in the checkout toast.
     const detail = process.env.NODE_ENV !== 'production' && err?.message ? ` (${err.message})` : '';
-    return res.status(500).json({ success: false, error: `Failed to place order${detail}` });
+    return fail(500, 'ORDER_FAILED', `We couldn't place your order. You have not been charged — please try again, or contact us with reference ${ref || 'N/A'}.${detail}`);
   }
 };
 
@@ -876,13 +1017,29 @@ exports.verifyRazorpay = async (req, res) => {
       log.warn('order.verify_order_mismatch', { requestId: req.id, orderId });
       return res.status(400).json({ success: false, error: "Payment does not belong to this order" });
     }
-    if (orderData.status !== "payment_pending") {
-      return res.status(200).json({ success: true, message: "Order already confirmed" });
+    if (orderData.status !== "payment_pending" && !isRevivableCancelledOrder(orderData)) {
+      if (orderData.razorpayPaymentId) {
+        return res.status(200).json({ success: true, status: orderData.status, message: "Order already confirmed" });
+      }
+      // Cancelled for another reason (never silently claim success for an unpaid order).
+      log.warn('order.verify_unexpected_state', { requestId: req.id, orderId, status: orderData.status });
+      return res.status(409).json({
+        success: false,
+        code: 'ORDER_NOT_PAYABLE',
+        error: "This order can no longer be paid. If money was deducted, it will be refunded automatically — or contact us with your payment ID.",
+      });
     }
 
     await confirmRazorpayPayment(orderId, razorpay_payment_id, 'verify');
+    const fresh = (await orderRef.get()).data() || {};
 
-    return res.status(200).json({ success: true, message: "Payment verified and order confirmed" });
+    return res.status(200).json({
+      success: true,
+      status: fresh.status,
+      message: fresh.status === 'payment_successful_no_stock'
+        ? "Payment received. An item sold out moments ago — our team will contact you to arrange it or refund you."
+        : "Payment verified and order confirmed",
+    });
   } catch (error) {
     log.error("order.verify_razorpay_failed", { requestId: req.id, err: error });
     const orderId = req.body?.orderId;
@@ -922,52 +1079,114 @@ function summarizePayment(p) {
  * transaction guarded by status === 'payment_pending', so the verify call and
  * the webhook race safely — only one wins.
  */
-async function confirmRazorpayPayment(orderId, paymentId, source) {
-  const orderRef = db.collection("orders").doc(orderId);
-  let confirmedData = null;
+/**
+ * A payment that is only `authorized` is NOT money in the bank: with auto-capture
+ * off (or a late authorisation) Razorpay refunds it to the customer after a few
+ * days unless we capture it. Capture it now; returns the (possibly updated)
+ * payment entity. Never throws.
+ */
+async function ensureCaptured(payment, orderId) {
+  if (!payment || payment.status !== 'authorized') return payment;
+  try {
+    return await razorpay.payments.capture(payment.id, payment.amount, payment.currency || 'INR');
+  } catch (err) {
+    // Often a harmless race with Razorpay's own auto-capture — re-check.
+    const fresh = await razorpay.payments.fetch(payment.id).catch(() => null);
+    if (fresh && fresh.status === 'captured') return fresh;
+    log.error('order.payment_capture_failed', { orderId, paymentId: payment.id, err });
+    createNotification('admin', 'Capture payment in Razorpay',
+      `Payment ${payment.id} for order #${String(orderId).slice(-6).toUpperCase()} is authorized but could not be captured. Capture it in the Razorpay dashboard or it will be auto-refunded.`,
+      { orderId });
+    return fresh || payment;
+  }
+}
 
-  // Fetch the instrument used (UPI / card / netbanking / wallet) for display.
+async function confirmRazorpayPayment(orderId, paymentId, source) {
+  // Fetch the instrument used (UPI / card / netbanking / wallet) for display,
+  // and capture the payment if it is only authorized.
   let paymentDetails = null;
   try {
-    paymentDetails = summarizePayment(await razorpay.payments.fetch(paymentId));
+    const payment = await ensureCaptured(await razorpay.payments.fetch(paymentId), orderId);
+    paymentDetails = summarizePayment(payment);
   } catch (e) {
     log.warn('order.payment_fetch_failed', { orderId, err: e });
   }
+  return markOrderPaid(orderId, { paymentId, paymentDetails, source });
+}
 
+/**
+ * Shared, idempotent "this order is now paid" transition — used for Razorpay
+ * payments (verify / webhook / reconcile / admin sync) and for payments an admin
+ * records manually. Takes stock back if the reservation had lapsed, finalises
+ * the coupon, bumps analytics, then notifies customer + team.
+ * Returns true when THIS call confirmed the order.
+ */
+async function markOrderPaid(orderId, { paymentId = null, paymentDetails = null, manualPayment = null, source }) {
+  const orderRef = db.collection("orders").doc(orderId);
+  let confirmedData = null;
+  let revived = false;
   await runStockTxn(async (t) => {
+    // ── ALL READS FIRST (Firestore throws on a read after a write) ──
     const oDoc = await t.get(orderRef);
-    if (!oDoc.exists || oDoc.data().status !== "payment_pending") return;
+    if (!oDoc.exists) return;
     const oData = oDoc.data();
+    const isPending = oData.status === "payment_pending";
+    const isLate = isRevivableCancelledOrder(oData);
+    if (!isPending && !isLate) return; // already confirmed / refunded / etc.
 
-    let newOrderStatus = "pending";
+    let resRef = null;
+    let resStatus = null;
     if (oData.reservationId) {
-      const resRef = db.collection("stockReservations").doc(oData.reservationId);
+      resRef = db.collection("stockReservations").doc(oData.reservationId);
       const resDoc = await t.get(resRef);
-      if (resDoc.exists) {
-        const resStatus = resDoc.data().status;
-        if (resStatus === 'ACTIVE') {
-          t.update(resRef, { status: 'CONFIRMED', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-        } else if (resStatus !== 'CONFIRMED') {
-          newOrderStatus = "payment_successful_no_stock"; // reservation expired, stock released
-        }
-      }
+      resStatus = resDoc.exists ? resDoc.data().status : null;
+      if (!resDoc.exists) resRef = null;
     }
+    // Stock was returned (expired/abandoned reservation) → try to take it again.
+    const needsRestock = isLate || (resStatus && resStatus !== 'ACTIVE' && resStatus !== 'CONFIRMED');
+    const restock = needsRestock ? await readRestock(t, oData.items) : null;
+    const coupon = await readCouponConfirm(t, oData);
 
-    // Record the coupon redemption now that payment has actually succeeded.
-    await confirmCouponInTxn(t, oData);
+    // ── WRITES ──
+    let newOrderStatus = "pending";
+    if (needsRestock) {
+      if (restock.available) applyRestockTake(t, restock);
+      else newOrderStatus = "payment_successful_no_stock"; // paid, but sold out meanwhile → team arranges stock or refunds
+    }
+    if (resRef && (resStatus === 'ACTIVE' || (needsRestock && restock.available))) {
+      t.update(resRef, { status: 'CONFIRMED', updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    }
+    applyCouponConfirm(t, coupon);
 
     t.update(orderRef, {
       status: newOrderStatus,
-      razorpayPaymentId: paymentId,
+      ...(paymentId ? { razorpayPaymentId: paymentId } : {}),
       ...(paymentDetails ? { paymentDetails } : {}),
+      ...(manualPayment ? { manualPayment } : {}),
+      paymentConfirmedBy: source,
+      ...(isLate ? { cancelReason: admin.firestore.FieldValue.delete(), revivedFromCancel: true } : {}),
       paidAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     incrementSalesAnalytics(t, oData, 'razorpay');
     confirmedData = { ...oData, status: newOrderStatus };
+    revived = isLate;
   });
 
-  if (!confirmedData) return; // someone else already confirmed
+  if (!confirmedData) {
+    // Normal when verify + webhook race (same payment already recorded). Anything
+    // else is money captured for an order we can't fulfil (or already paid by
+    // another payment / a manual entry) → the team must refund the extra one.
+    const cur = (await orderRef.get().catch(() => null))?.data();
+    if (paymentId && cur && cur.razorpayPaymentId !== paymentId) {
+      log.error('order.payment_captured_unmatched', { orderId, paymentId, status: cur.status });
+      createNotification('admin', 'Payment needs attention',
+        `Payment ${paymentId} was captured for order #${orderId.slice(-6).toUpperCase()} (status: ${cur.status}${cur.manualPayment ? ', already marked paid manually' : ''}). Refund it from Razorpay if it is a duplicate or the order won't be fulfilled.`,
+        { orderId });
+    }
+    return false;
+  }
+  if (revived) log.warn('order.late_payment_revived', { orderId, paymentId, status: confirmedData.status });
 
   // Push in-stock paid orders to Shiprocket (no-op when Shiprocket isn't configured).
   if (confirmedData.status === 'pending') autoCreateShipment(orderId);
@@ -976,27 +1195,66 @@ async function confirmRazorpayPayment(orderId, paymentId, source) {
   sendOrderEmail(orderId, 'paid');
   alertTeamOfPaidOrder(orderId);
   // The team is emailed the full order by alertTeamOfPaidOrder above.
-  log.info('order.razorpay_confirmed', { orderId, source });
+  log.info('order.payment_confirmed', { orderId, source });
+  return true;
 }
 
+/** True for an order whose payment has not been confirmed yet (and could still be). */
+const isAwaitingPayment = (o) => !!o && (o.status === 'payment_pending' || isRevivableCancelledOrder(o));
+
+const tsMillis = (v) => {
+  if (!v) return 0;
+  if (typeof v.toMillis === 'function') return v.toMillis();
+  if (typeof v.toDate === 'function') return v.toDate().getTime();
+  if (typeof v._seconds === 'number') return v._seconds * 1000;
+  const n = new Date(v).getTime();
+  return Number.isFinite(n) ? n : 0;
+};
+
 /**
- * Ask Razorpay whether a still-`payment_pending` order was actually paid, and
- * confirm it if so. Covers a lost browser verify call when the webhook can't
- * reach us (e.g. local dev) — without it a paid order would later be cancelled
- * by the reservation cleanup. Returns true when the order is (now) paid.
+ * Ask Razorpay whether an unpaid order was actually paid, and confirm it if so.
+ * Covers a lost browser verify call and a missed / misconfigured webhook —
+ * without it a paid order stays "pending" on the dashboard or gets cancelled by
+ * the reservation cleanup. An `authorized` payment counts (it is captured here).
+ *
+ * `includeCancelled`: also check orders the system auto-cancelled when the
+ * payment window lapsed (slow UPI that completed after the customer closed the
+ * Razorpay window). Off by default on hot read paths to avoid a Razorpay call
+ * for every old cancelled order.
+ * Returns true when the order is (now) paid.
  */
-async function reconcileRazorpayOrder(orderId, oData) {
-  if (!oData || oData.status !== 'payment_pending' || !oData.razorpayOrderId) return false;
+async function reconcileRazorpayOrder(orderId, oData, { includeCancelled = false } = {}) {
+  if (!oData || !oData.razorpayOrderId) return false;
+  const eligible = oData.status === 'payment_pending' || (includeCancelled && isRevivableCancelledOrder(oData));
+  if (!eligible) return false;
   try {
     const { items = [] } = await razorpay.orders.fetchPayments(oData.razorpayOrderId);
-    const paid = items.find((p) => p.status === 'captured');
+    const paid = items.find((p) => p.status === 'captured') || items.find((p) => p.status === 'authorized');
     if (!paid) return false;
     await confirmRazorpayPayment(orderId, paid.id, 'reconcile');
-    return true;
+    const now = (await db.collection('orders').doc(orderId).get()).data();
+    return !!now && !isAwaitingPayment(now);
   } catch (err) {
     log.warn('order.razorpay_reconcile_failed', { orderId, err });
     return false;
   }
+}
+
+// Recently auto-cancelled orders are re-checked too (a late UPI payment can land
+// hours after the window closed).
+const RECHECK_CANCELLED_MS = 3 * 24 * 60 * 60 * 1000;
+const recentlyCancelledUnpaid = (o) => isRevivableCancelledOrder(o)
+  && Date.now() - tsMillis(o.updatedAt || o.createdAt) < RECHECK_CANCELLED_MS;
+
+/** Run `fn` over `items` with at most `n` in flight (keeps Razorpay calls polite). */
+async function mapLimit(items, n, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 /**
@@ -1048,6 +1306,26 @@ async function reconcileDashboardRefund(entity) {
   createNotification('admin', 'Refund Processed', `Refund for order ${short} was processed (Razorpay webhook).`, { orderId: orderRef.id });
 }
 
+/**
+ * Our order for a Razorpay order: by stored razorpayOrderId, else by the order ID
+ * we stamp into the Razorpay order's notes (only trusted when the stored
+ * razorpayOrderId agrees, or the order has none recorded).
+ */
+async function findOrderIdForRazorpay(razorpayOrderId, notedOrderId) {
+  if (razorpayOrderId) {
+    const snap = await db.collection("orders").where("razorpayOrderId", "==", razorpayOrderId).limit(1).get();
+    if (!snap.empty) return snap.docs[0].id;
+  }
+  if (notedOrderId && typeof notedOrderId === 'string') {
+    const doc = await db.collection("orders").doc(notedOrderId).get();
+    if (doc.exists) {
+      const stored = doc.data().razorpayOrderId;
+      if (!stored || stored === razorpayOrderId) return doc.id;
+    }
+  }
+  return null;
+}
+
 exports.razorpayWebhook = async (req, res) => {
   let eventRef = null;
   try {
@@ -1086,15 +1364,22 @@ exports.razorpayWebhook = async (req, res) => {
 
     log.info('webhook.received', { requestId: req.id, event: payload.event, eventId });
 
-    if (payload.event === 'payment.captured') {
+    // Any of these means the customer paid. Subscribing to only one of them in the
+    // Razorpay dashboard used to leave paid orders stuck as "pending":
+    //  - payment.captured — normal auto-capture
+    //  - order.paid       — fired once the Razorpay order is fully paid
+    //  - payment.authorized — auto-capture OFF: we must capture it ourselves,
+    //    otherwise Razorpay refunds the customer after a few days.
+    if (['payment.captured', 'order.paid', 'payment.authorized'].includes(payload.event)) {
       const entity = payload.payload?.payment?.entity || {};
-      const razorpayOrderId = entity.order_id;
+      const orderEntity = payload.payload?.order?.entity || {};
+      const razorpayOrderId = entity.order_id || orderEntity.id;
       const paymentId = entity.id;
-      if (razorpayOrderId) {
-        const snap = await db.collection("orders").where("razorpayOrderId", "==", razorpayOrderId).limit(1).get();
-        if (!snap.empty) {
-          await confirmRazorpayPayment(snap.docs[0].id, paymentId, 'webhook');
-        }
+      const orderId = paymentId ? await findOrderIdForRazorpay(razorpayOrderId, entity.notes?.orderId || orderEntity.notes?.orderId) : null;
+      if (orderId) {
+        await confirmRazorpayPayment(orderId, paymentId, `webhook:${payload.event}`);
+      } else if (paymentId) {
+        log.warn('webhook.payment_no_order', { razorpayOrderId, paymentId, event: payload.event });
       }
     } else if (payload.event === 'refund.processed' || payload.event === 'refund.created') {
       // Dashboard-initiated refunds — reconcile them back to the order.
@@ -1210,6 +1495,228 @@ exports.abandonPayment = async (req, res) => {
   }
 };
 
+// ── Admin: resolve payments that Razorpay received but the dashboard missed ──
+
+const notAwaitingError = (o) => (o.razorpayPaymentId || o.manualPayment
+  ? 'This order is already marked as paid'
+  : `This order can't be marked paid from status "${o.status}"`);
+
+/**
+ * POST /orders/:id/sync-payment  (admin).  Body: { paymentId? }
+ *  - no paymentId: ask Razorpay for this order's payments and confirm it if one
+ *    was captured/authorized.
+ *  - paymentId (pay_…, copied from the Razorpay dashboard): fetch that payment
+ *    from Razorpay and confirm the order with it after checking it is genuinely
+ *    paid, is for this order (or an unlinked payment of at least the order
+ *    total, e.g. a payment link / QR) and isn't already used by another order.
+ */
+exports.syncOrderPayment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const orderRef = db.collection('orders').doc(id);
+    const snap = await orderRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'Order not found' });
+    const order = snap.data();
+    if (!isAwaitingPayment(order)) {
+      return res.status(409).json({ success: false, error: notAwaitingError(order) });
+    }
+
+    const paymentId = String(req.body?.paymentId || '').trim();
+    if (!paymentId) {
+      const paid = await reconcileRazorpayOrder(id, order, { includeCancelled: true });
+      if (!paid) {
+        return res.status(200).json({ success: true, paid: false, message: 'Razorpay has no successful payment for this order yet.' });
+      }
+    } else {
+      if (!/^pay_[A-Za-z0-9]{6,30}$/.test(paymentId)) {
+        return res.status(400).json({ success: false, error: 'Enter a Razorpay payment ID like pay_XXXXXXXXXXXXXX' });
+      }
+      let payment;
+      try {
+        payment = await razorpay.payments.fetch(paymentId);
+      } catch (err) {
+        const desc = err?.error?.description;
+        return res.status(400).json({ success: false, error: desc ? `Razorpay: ${desc}` : 'Razorpay has no payment with that ID' });
+      }
+      if (!['captured', 'authorized'].includes(payment?.status)) {
+        return res.status(400).json({ success: false, error: `That payment is "${payment?.status || 'unknown'}" in Razorpay, not paid` });
+      }
+      const expectedPaise = Math.round((Number(order.totalAmount) || 0) * 100);
+      if (payment.order_id && payment.order_id !== order.razorpayOrderId) {
+        return res.status(400).json({ success: false, error: `That payment belongs to a different Razorpay order (${payment.order_id})` });
+      }
+      if (!payment.order_id && Number(payment.amount) < expectedPaise) {
+        return res.status(400).json({ success: false, error: `That payment is ₹${Number(payment.amount) / 100}, less than the order total ₹${expectedPaise / 100}` });
+      }
+      const used = await db.collection('orders').where('razorpayPaymentId', '==', paymentId).limit(1).get();
+      if (!used.empty && used.docs[0].id !== id) {
+        return res.status(409).json({ success: false, error: `That payment is already linked to order #${used.docs[0].id.slice(-6).toUpperCase()}` });
+      }
+      await confirmRazorpayPayment(id, paymentId, 'admin_sync');
+    }
+
+    const fresh = (await orderRef.get()).data() || {};
+    if (isAwaitingPayment(fresh)) {
+      return res.status(409).json({ success: false, error: 'Could not confirm the payment — please try again' });
+    }
+    createAuditLog({
+      adminId: req.user.uid,
+      adminEmail: req.user.email || 'unknown',
+      action: 'SYNC_ORDER_PAYMENT',
+      resourceId: id,
+      previousState: { status: order.status },
+      newState: { status: fresh.status, razorpayPaymentId: fresh.razorpayPaymentId || null },
+      ipAddress: req.ip,
+    });
+    return res.status(200).json({
+      success: true,
+      paid: true,
+      message: fresh.status === 'payment_successful_no_stock'
+        ? 'Payment confirmed — but an item is out of stock now. Arrange stock or refund the customer.'
+        : 'Payment confirmed from Razorpay — order is now placed.',
+      data: orderForViewer({ id, ...fresh }, req.user),
+    });
+  } catch (err) {
+    log.error('order.sync_payment_failed', { requestId: req.id, orderId: req.params.id, err });
+    return res.status(500).json({ success: false, error: 'Failed to check the payment with Razorpay' });
+  }
+};
+
+const MANUAL_PAYMENT_METHODS = ['upi', 'bank_transfer', 'cash', 'razorpay_link', 'other'];
+
+/**
+ * POST /orders/:id/mark-paid  (admin) — record a payment received OUTSIDE this
+ * order's Razorpay checkout (direct UPI / bank transfer / cash / a payment link).
+ * Body: { method, reference, amount, note? }.
+ * Razorpay is checked first: if it shows the order paid, that is used instead.
+ */
+exports.markOrderPaidManually = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const method = String(req.body?.method || '').trim();
+    const reference = String(req.body?.reference || '').trim().slice(0, 100);
+    const note = String(req.body?.note || '').trim().slice(0, 500);
+    const amount = Number(req.body?.amount);
+
+    if (!MANUAL_PAYMENT_METHODS.includes(method)) {
+      return res.status(400).json({ success: false, error: 'Choose how the payment was received' });
+    }
+    if (method !== 'cash' && reference.length < 4) {
+      return res.status(400).json({ success: false, error: 'Enter the transaction reference (UTR / UPI ref / payment ID)' });
+    }
+    if (method === 'cash' && !reference && note.length < 4) {
+      return res.status(400).json({ success: false, error: 'Add a note (who collected the cash, when)' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, error: 'Enter the amount received' });
+    }
+
+    const orderRef = db.collection('orders').doc(id);
+    const snap = await orderRef.get();
+    if (!snap.exists) return res.status(404).json({ success: false, error: 'Order not found' });
+    const order = snap.data();
+    if (!isAwaitingPayment(order)) {
+      return res.status(409).json({ success: false, error: notAwaitingError(order) });
+    }
+    const total = Number(order.totalAmount) || 0;
+    if (amount + 0.005 < total) {
+      return res.status(400).json({ success: false, error: `Amount received (₹${amount}) is less than the order total (₹${total})` });
+    }
+
+    // Never record a manual payment for an order Razorpay already got paid for —
+    // that would hide a real gateway payment (and a possible double charge).
+    if (await reconcileRazorpayOrder(id, order, { includeCancelled: true })) {
+      const fresh = (await orderRef.get()).data() || {};
+      return res.status(200).json({
+        success: true,
+        reconciled: true,
+        message: 'Razorpay already shows this order as paid — confirmed with the Razorpay payment instead.',
+        data: orderForViewer({ id, ...fresh }, req.user),
+      });
+    }
+
+    if (reference) {
+      const dup = await db.collection('orders').where('manualPayment.reference', '==', reference).limit(1).get();
+      if (!dup.empty && dup.docs[0].id !== id) {
+        return res.status(409).json({ success: false, error: `Reference ${reference} is already recorded on order #${dup.docs[0].id.slice(-6).toUpperCase()}` });
+      }
+    }
+
+    const manualPayment = {
+      method, reference: reference || null, amount, note: note || null,
+      recordedBy: { uid: req.user.uid, email: req.user.email || null },
+      recordedAt: new Date().toISOString(),
+    };
+    const confirmed = await markOrderPaid(id, {
+      manualPayment,
+      paymentDetails: { method, detail: reference ? `Manual · ${reference}` : 'Manual' },
+      source: 'admin_manual',
+    });
+    if (!confirmed) {
+      return res.status(409).json({ success: false, error: 'The order changed meanwhile — refresh and check again' });
+    }
+
+    const fresh = (await orderRef.get()).data() || {};
+    createAuditLog({
+      adminId: req.user.uid,
+      adminEmail: req.user.email || 'unknown',
+      action: 'MARK_ORDER_PAID_MANUAL',
+      resourceId: id,
+      previousState: { status: order.status },
+      newState: { status: fresh.status, method, reference: reference || null, amount },
+      ipAddress: req.ip,
+    });
+    return res.status(200).json({
+      success: true,
+      message: fresh.status === 'payment_successful_no_stock'
+        ? 'Payment recorded — but an item is out of stock now. Arrange stock or refund the customer.'
+        : 'Payment recorded — order is now placed.',
+      data: orderForViewer({ id, ...fresh }, req.user),
+    });
+  } catch (err) {
+    log.error('order.mark_paid_failed', { requestId: req.id, orderId: req.params.id, err });
+    return res.status(500).json({ success: false, error: 'Failed to record the payment' });
+  }
+};
+
+/**
+ * POST /orders/admin/sync-payments  (admin) — check every unpaid order (still
+ * awaiting payment, or auto-cancelled in the last 3 days) against Razorpay and
+ * confirm the ones that were actually paid.
+ */
+exports.syncPendingPayments = async (req, res) => {
+  try {
+    const [pendingSnap, cancelledSnap] = await Promise.all([
+      db.collection('orders').where('status', '==', 'payment_pending').limit(200).get(),
+      db.collection('orders').where('status', '==', 'cancelled').limit(500).get(),
+    ]);
+    const candidates = [
+      ...pendingSnap.docs,
+      ...cancelledSnap.docs.filter((d) => recentlyCancelledUnpaid(d.data())),
+    ].filter((d) => d.data().razorpayOrderId);
+
+    const results = await mapLimit(candidates, 4, async (d) => (
+      (await reconcileRazorpayOrder(d.id, d.data(), { includeCancelled: true })) ? d.id : null
+    ));
+    const confirmed = results.filter(Boolean);
+    if (confirmed.length) {
+      createAuditLog({
+        adminId: req.user.uid,
+        adminEmail: req.user.email || 'unknown',
+        action: 'SYNC_PENDING_PAYMENTS',
+        resourceId: 'orders',
+        previousState: null,
+        newState: { confirmed },
+        ipAddress: req.ip,
+      });
+    }
+    return res.status(200).json({ success: true, data: { checked: candidates.length, confirmed } });
+  } catch (err) {
+    log.error('order.sync_pending_payments_failed', { requestId: req.id, err });
+    return res.status(500).json({ success: false, error: 'Failed to sync payments with Razorpay' });
+  }
+};
+
 /**
  * POST /orders/:id/refund  (admin).  Body: { amount? } — paise-agnostic rupees;
  * omit for a full refund.
@@ -1230,7 +1737,9 @@ exports.refundOrder = async (req, res) => {
       return res.status(400).json({ success: false, error: "Order is not in a refundable state" });
     }
 
-    const isRazorpay = order.customerInfo?.paymentMethod === 'razorpay';
+    // A payment the admin recorded manually (bank transfer / cash / direct UPI)
+    // never went through Razorpay — refund it outside and just record it here.
+    const isRazorpay = order.customerInfo?.paymentMethod === 'razorpay' && !(order.manualPayment && !order.razorpayPaymentId);
     const fullAmount = Number(order.totalAmount) || 0;
     const requested = req.body?.amount != null ? Number(req.body.amount) : fullAmount;
     if (!Number.isFinite(requested) || requested <= 0 || requested > fullAmount) {

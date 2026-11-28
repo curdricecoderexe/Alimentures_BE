@@ -25,10 +25,12 @@ process.env.INTERNAL_CRON = 'false';
 const db = new FakeFirestore();
 
 // Scripted Razorpay: tests set the behaviour per case.
-const razorpayCalls = { ordersCreated: [] };
+const razorpayCalls = { ordersCreated: [], captured: [] };
 const razorpayBehaviour = {
   createOrder: async (opts) => ({ id: `order_rzp_${razorpayCalls.ordersCreated.length + 1}`, amount: opts.amount }),
   fetchPayments: async () => ({ items: [] }),
+  fetchPayment: async (id) => ({ id, method: 'upi', vpa: 'test@upi', status: 'captured' }),
+  capturePayment: async (id, amount) => ({ id, amount, method: 'upi', status: 'captured' }),
 };
 class FakeRazorpay {
   constructor() {
@@ -37,7 +39,8 @@ class FakeRazorpay {
       fetchPayments: (id) => razorpayBehaviour.fetchPayments(id),
     };
     this.payments = {
-      fetch: async (id) => ({ id, method: 'upi', vpa: 'test@upi', status: 'captured' }),
+      fetch: (id) => razorpayBehaviour.fetchPayment(id),
+      capture: (id, amount, currency) => { razorpayCalls.captured.push({ id, amount, currency }); return razorpayBehaviour.capturePayment(id, amount, currency); },
       refund: async (id, opts) => ({ id: `rfnd_${id}`, amount: opts?.amount, status: 'processed' }),
     };
   }

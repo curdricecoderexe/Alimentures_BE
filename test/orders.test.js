@@ -315,3 +315,127 @@ test('deleting orders needs the emailed OTP; any status can go and is archived f
   assert.equal(reuse.statusCode, 400);
   assert.ok(db.read('orders/again'));
 });
+
+// ── payment edge cases (coupon + late payments) ─────────────────────────────
+
+async function couponOrder() {
+  db.seed('coupons/w1', {
+    code: 'WELCOME10-ABCDEF', kind: 'welcome', assignedTo: USER.uid, discountType: 'percentage', discountValue: 10,
+    minOrderValue: 0, maxUsage: 1, usedCount: 0, isActive: true, expiresAt: null,
+  });
+  const res = await placeOrder({ couponCode: 'WELCOME10-ABCDEF', items: [{ productId: 'cookie', selectedWeight: '120g', quantity: 1 }] });
+  assert.equal(res.statusCode, 201, JSON.stringify(res.body));
+  return { orderId: res.body.orderId, rzpOrderId: res.body.razorpayOrderId };
+}
+
+test('a paid order that used a coupon is confirmed (verify) and the redemption is finalised', async () => {
+  const { orderId, rzpOrderId } = await couponOrder();
+  const signature = sign(process.env.RAZORPAY_KEY_SECRET, `${rzpOrderId}|pay_c1`);
+  const res = await verify({ orderId, razorpay_order_id: rzpOrderId, razorpay_payment_id: 'pay_c1', razorpay_signature: signature });
+
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const order = db.read(`orders/${orderId}`);
+  assert.equal(order.status, 'pending');
+  assert.equal(db.read(`stockReservations/${order.reservationId}`).status, 'CONFIRMED');
+  assert.equal(db.read(`couponRedemptions/w1_${USER.uid}`).pending, false);
+});
+
+test('a paid coupon order is confirmed by the webhook too', async () => {
+  const { orderId, rzpOrderId } = await couponOrder();
+  assert.equal((await webhook(captured(rzpOrderId, 'pay_c2'), { eventId: 'evt_c2' })).statusCode, 200);
+  assert.equal(db.read(`orders/${orderId}`).status, 'pending');
+});
+
+test('a payment captured after the order was auto-cancelled revives it (stock re-reserved)', async () => {
+  const { orderId, rzpOrderId } = await pendingOrder();
+  // Customer closed the Razorpay window → order cancelled, stock returned…
+  const abandon = mockRes();
+  await orders.abandonPayment({ params: { id: orderId }, user: USER, id: 'req' }, abandon);
+  assert.equal(db.read(`orders/${orderId}`).status, 'cancelled');
+  assert.equal(variantStock('cookie'), 5);
+
+  // …but their UPI payment completed a minute later.
+  assert.equal((await webhook(captured(rzpOrderId, 'pay_late'), { eventId: 'evt_late' })).statusCode, 200);
+  const order = db.read(`orders/${orderId}`);
+  assert.equal(order.status, 'pending', 'paid order must not stay cancelled');
+  assert.equal(order.razorpayPaymentId, 'pay_late');
+  assert.equal(variantStock('cookie'), 4, 'stock taken again');
+});
+
+test('a late payment for a cancelled order with no stock left is flagged for the team, not lost', async () => {
+  const { orderId, rzpOrderId } = await pendingOrder();
+  const abandon = mockRes();
+  await orders.abandonPayment({ params: { id: orderId }, user: USER, id: 'req' }, abandon);
+  db.seed('products/cookie', { ...db.read('products/cookie'), stock: 0, variants: [{ ...db.read('products/cookie').variants[0], stock: 0 }] });
+
+  const signature = sign(process.env.RAZORPAY_KEY_SECRET, `${rzpOrderId}|pay_late2`);
+  const res = await verify({ orderId, razorpay_order_id: rzpOrderId, razorpay_payment_id: 'pay_late2', razorpay_signature: signature });
+  assert.equal(res.statusCode, 200);
+  const order = db.read(`orders/${orderId}`);
+  assert.equal(order.status, 'payment_successful_no_stock');
+  assert.equal(order.razorpayPaymentId, 'pay_late2');
+  assert.equal(variantStock('cookie'), 0, 'never oversold');
+});
+
+test('two sizes of the same product in one cart are both deducted and both returned', async () => {
+  db.seed('products/honey', {
+    title: 'Honey', category: 'Others', price: 200, stock: 15,
+    variants: [{ weight: '250g', price: 200, stock: 10 }, { weight: '500g', price: 380, stock: 5 }],
+  });
+  const res = await placeOrder({ items: [
+    { productId: 'honey', selectedWeight: '250g', quantity: 2 },
+    { productId: 'honey', selectedWeight: '500g', quantity: 1 },
+  ] });
+  assert.equal(res.statusCode, 201, JSON.stringify(res.body));
+  let v = db.read('products/honey').variants;
+  assert.deepEqual([v[0].stock, v[1].stock], [8, 4]);
+
+  const abandon = mockRes();
+  await orders.abandonPayment({ params: { id: res.body.orderId }, user: USER, id: 'req' }, abandon);
+  v = db.read('products/honey').variants;
+  assert.deepEqual([v[0].stock, v[1].stock], [10, 5], 'both sizes returned');
+});
+
+test('checkout refuses a missing/invalid mobile number and a stale coupon with a clear message', async () => {
+  const items = [{ productId: 'cookie', selectedWeight: '120g', quantity: 1 }];
+  let res = mockRes();
+  await orders.createOrder({ body: { customerInfo: { ...customerInfo, phone: '12345' }, items }, user: USER, headers: {}, id: 'req' }, res);
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'PHONE_INVALID');
+
+  res = await placeOrder({ items, couponCode: 'NOPE' });
+  assert.equal(res.statusCode, 400);
+  assert.equal(res.body.code, 'COUPON_INVALID');
+  assert.equal(variantStock('cookie'), 5, 'nothing reserved');
+});
+
+test('an out-of-stock line explains how many are left', async () => {
+  const res = await placeOrder({ items: [{ productId: 'ghee', selectedWeight: '500ml', quantity: 3 }] });
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, 'OUT_OF_STOCK');
+  assert.match(res.body.error, /Only 2 left/);
+});
+
+test('expiry cleanup still runs when the composite index is missing (falls back to an in-memory filter)', async () => {
+  const { orderId } = await pendingOrder();
+  const order = db.read(`orders/${orderId}`);
+  db.seed(`stockReservations/${order.reservationId}`, {
+    ...db.read(`stockReservations/${order.reservationId}`),
+    expiresAt: new Date(Date.now() - 60 * 1000),
+  });
+  // Simulate production without the index: a 2-filter (equality + range) query fails with code 9.
+  const Query = Object.getPrototypeOf(Object.getPrototypeOf(db.collection('stockReservations')));
+  const realGet = Query.get;
+  Query.get = async function () {
+    const filters = this._filters || this.filters || [];
+    if (Array.isArray(filters) && filters.length >= 2) { const e = new Error('FAILED_PRECONDITION: The query requires an index.'); e.code = 9; throw e; }
+    return realGet.call(this);
+  };
+  try {
+    await orders.cleanupExpiredReservations();
+  } finally {
+    Query.get = realGet;
+  }
+  assert.equal(db.read(`orders/${orderId}`).status, 'cancelled');
+  assert.equal(variantStock('cookie'), 5, 'stock released');
+});

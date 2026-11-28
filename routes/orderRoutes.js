@@ -15,6 +15,9 @@ const {
   refundOrder,
   requestDeleteOtp,
   deleteOrdersWithOtp,
+  syncOrderPayment,
+  markOrderPaidManually,
+  syncPendingPayments,
 } = require("../controllers/orderController");
 
 const verifyToken = require("../middlewares/verifyToken");
@@ -43,6 +46,12 @@ router.put("/:id/status", verifyToken, isStaff, updateOrderStatus);
 // Releases the stock reservation for an order that never got past payment
 // (still `payment_pending`) — not a general cancellation route.
 router.put("/:id/abandon-payment", verifyToken, abandonPayment);
+
+// Payment resolution (admin only) — for payments Razorpay received but the
+// dashboard still shows as pending/cancelled, or payments taken outside Razorpay.
+router.post("/admin/sync-payments", verifyToken, isAdmin, syncPendingPayments);
+router.post("/:id/sync-payment", verifyToken, isAdmin, syncOrderPayment);
+router.post("/:id/mark-paid", verifyToken, isAdmin, markOrderPaidManually);
 
 // Refund (admin only)
 router.post("/:id/refund", verifyToken, isAdmin, refundOrder);

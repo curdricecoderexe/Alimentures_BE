@@ -40,7 +40,9 @@ function writeFields(target, data, { dotted }) {
       obj[leaf] = typeof obj[leaf] === 'object' && obj[leaf] !== null ? obj[leaf] : {};
       writeFields(obj[leaf], value, { dotted: false });
     } else {
-      obj[leaf] = applyValue(obj[leaf], value instanceof Date ? value : clone(value));
+      // Transforms must be applied before cloning (structuredClone drops their class).
+      const isTransform = /Transform$/.test(value?.constructor?.name || '');
+      obj[leaf] = applyValue(obj[leaf], isTransform || value instanceof Date ? value : clone(value));
     }
   }
 }
@@ -121,7 +123,16 @@ class CollectionRef extends Query {
 
 class Transaction {
   constructor(store) { this._store = store; this._writes = []; }
-  async get(refOrQuery) { return refOrQuery.get(); }
+  // Same rule as the real SDK (transaction.js READ_AFTER_WRITE_ERROR_MSG): a read
+  // after any write throws, so tests catch transactions that only work on paper.
+  async get(refOrQuery) {
+    if (this._writes.length) throw new Error('Firestore transactions require all reads to be executed before all writes.');
+    return refOrQuery.get();
+  }
+  async getAll(...refs) {
+    if (this._writes.length) throw new Error('Firestore transactions require all reads to be executed before all writes.');
+    return Promise.all(refs.map((r) => r.get()));
+  }
   set(ref, data, opts = {}) { this._writes.push(() => this._store.write(ref.path, data, opts.merge ? 'merge' : 'set')); return this; }
   update(ref, data) { this._writes.push(() => this._store.write(ref.path, data, 'update')); return this; }
   create(ref, data) { this._writes.push(() => this._store.write(ref.path, data, 'create')); return this; }
